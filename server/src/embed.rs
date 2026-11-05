@@ -19,10 +19,11 @@ use serde_json::{Value, json};
 use typst_layout::PagedDocument;
 
 use crate::core::CoreMsg;
-use crate::render::{Bitmap, RenderKey, RenderPool};
+use crate::diff;
+use crate::render::{self, Bitmap, RenderKey, RenderPool, Strips};
 use crate::viewer::{Marker, UiEvent, UiSender};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("ZED_TYPST_PREVIEW_SOCKET") {
@@ -47,6 +48,8 @@ pub fn connect() -> Option<UnixStream> {
 enum Payload {
     None,
     Bitmap(Arc<Bitmap>),
+    /// Rows `start..end` of a bitmap (one strip of a rendered run).
+    Rows(Arc<Bitmap>, u32, u32),
 }
 
 pub fn write_frame(w: &mut impl Write, header: &Value, payload: &[u8]) -> io::Result<()> {
@@ -83,6 +86,15 @@ fn parse_hash(v: &Value) -> Option<u128> {
     u128::from_str_radix(v.as_str()?, 16).ok()
 }
 
+fn skipped_json(key: &RenderKey, strips: Option<Strips>) -> Value {
+    let mut v = json!({ "type": "skipped", "hash": format!("{:x}", key.hash), "scale_milli": key.scale_milli });
+    if let Some(s) = strips {
+        v["first"] = s.first.into();
+        v["end"] = s.end.into();
+    }
+    v
+}
+
 enum In {
     Ui(UiEvent),
     Zed(Value),
@@ -109,6 +121,10 @@ pub fn run(stream: UnixStream) {
                 let bytes = match &payload {
                     Payload::None => &[][..],
                     Payload::Bitmap(b) => pixels_as_bytes(b),
+                    Payload::Rows(b, start, end) => {
+                        let row = b.width as usize * 4;
+                        &pixels_as_bytes(b)[*start as usize * row..*end as usize * row]
+                    }
                 };
                 if write_frame(&mut w, &header, bytes).is_err() {
                     return;
@@ -159,6 +175,13 @@ pub fn run(stream: UnixStream) {
     let mut doc: Option<Arc<PagedDocument>> = None;
     let mut hashes: Vec<u128> = Vec::new();
     let mut invert = false;
+    // What the pane asked for last: lets us render the changed strips of a
+    // new document before the pane asks for them.
+    let mut last_wanted: HashSet<RenderKey> = HashSet::new();
+    let mut strip_px: Option<u32> = None;
+    // Strips pushed for the current document: stay wanted even if a request
+    // the pane sent before it saw the document arrives late.
+    let mut pushed_keys: HashSet<RenderKey> = HashSet::new();
 
     let to_core = |core: &Option<Sender<CoreMsg>>, queued: &mut Vec<CoreMsg>, msg: CoreMsg| match core {
         Some(c) => {
@@ -184,12 +207,42 @@ pub fn run(stream: UnixStream) {
                     Payload::None,
                 ),
                 UiEvent::Document(update) => {
-                    hashes = update.pages.iter().map(|p| p.hash).collect();
-                    doc = Some(update.doc);
+                    let old_hashes = std::mem::replace(&mut hashes, update.pages.iter().map(|p| p.hash).collect());
+                    doc = Some(update.doc.clone());
+                    let mut pushes = Vec::new();
                     let pages: Vec<Value> = update
                         .pages
                         .iter()
-                        .map(|p| json!({ "width": p.width, "height": p.height, "hash": format!("{:x}", p.hash) }))
+                        .enumerate()
+                        .map(|(i, p)| {
+                            let mut v = json!({ "width": p.width, "height": p.height, "hash": format!("{:x}", p.hash) });
+                            let Some((base, bands)) = &p.diff else { return v };
+                            v["base"] = format!("{base:x}").into();
+                            v["dirty"] = bands.iter().map(|&(a, b)| json!([a, b])).collect::<Vec<_>>().into();
+                            // The pane showed the old version: re-render the
+                            // strips that changed at the same resolution now.
+                            let (Some(strip_px), Some(page)) = (strip_px, update.doc.pages().get(i)) else { return v };
+                            if old_hashes.get(i) != Some(base) {
+                                return v;
+                            }
+                            let mut pushed = Vec::new();
+                            for old in last_wanted.iter().filter(|k| k.hash == *base && k.invert == invert) {
+                                let key = RenderKey { hash: p.hash, ..*old };
+                                let (_, height_px) = render::page_px(page, key.scale());
+                                let strips = diff::dirty_strips(bands, key.scale(), height_px, strip_px);
+                                if strips.is_empty() {
+                                    continue;
+                                }
+                                pushed.push(json!({ "scale_milli": key.scale_milli, "strip_px": strip_px, "strips": strips }));
+                                for run in render::runs(&strips, strip_px) {
+                                    pushes.push((key, i, run));
+                                }
+                            }
+                            if !pushed.is_empty() {
+                                v["pushed"] = pushed.into();
+                            }
+                            v
+                        })
                         .collect();
                     send(
                         json!({
@@ -201,6 +254,13 @@ pub fn run(stream: UnixStream) {
                         }),
                         Payload::None,
                     );
+                    // After the document message, so the pane knows the pages.
+                    pushed_keys = pushes.iter().map(|(key, _, _)| *key).collect();
+                    for (key, index, run) in pushes {
+                        pool.add_wanted(key);
+                        last_wanted.insert(key);
+                        pool.submit_strips(key, update.doc.clone(), index, run);
+                    }
                 }
                 UiEvent::Status(status) => send(
                     json!({
@@ -228,24 +288,38 @@ pub fn run(stream: UnixStream) {
                         send(json!({ "type": "invalidate" }), Payload::None);
                     }
                 }
-                UiEvent::Rendered(key, bitmap) => {
-                    if key.invert == invert {
-                        send(
-                            json!({
-                                "type": "bitmap",
-                                "hash": format!("{:x}", key.hash),
-                                "scale_milli": key.scale_milli,
-                                "width": bitmap.width,
-                                "height": bitmap.height,
-                            }),
-                            Payload::Bitmap(bitmap),
-                        );
+                UiEvent::Rendered(key, strips, bitmap) => {
+                    if key.invert != invert {
+                        continue;
+                    }
+                    let header = |height: u32| {
+                        json!({
+                            "type": "bitmap",
+                            "hash": format!("{:x}", key.hash),
+                            "scale_milli": key.scale_milli,
+                            "width": bitmap.width,
+                            "height": height,
+                        })
+                    };
+                    match strips {
+                        None => send(header(bitmap.height), Payload::Bitmap(bitmap.clone())),
+                        // One frame (and one image in the pane) per strip.
+                        Some(s) => {
+                            for k in s.first..s.end {
+                                let start = (k - s.first) * s.strip_px;
+                                let end = (start + s.strip_px).min(bitmap.height);
+                                if start >= end {
+                                    break;
+                                }
+                                let mut h = header(end - start);
+                                h["strip"] = k.into();
+                                h["strip_px"] = s.strip_px.into();
+                                send(h, Payload::Rows(bitmap.clone(), start, end));
+                            }
+                        }
                     }
                 }
-                UiEvent::RenderSkipped(key) => send(
-                    json!({ "type": "skipped", "hash": format!("{:x}", key.hash), "scale_milli": key.scale_milli }),
-                    Payload::None,
-                ),
+                UiEvent::RenderSkipped(key, strips) => send(skipped_json(&key, strips), Payload::None),
                 UiEvent::CoreReady(tx) => {
                     for m in queued.drain(..) {
                         let _ = tx.send(m);
@@ -294,21 +368,32 @@ pub fn run(stream: UnixStream) {
                             .and_then(Value::as_array)
                             .map(|a| a.iter().filter_map(key).collect())
                             .unwrap_or_default();
-                        pool.set_wanted(wanted);
+                        last_wanted = wanted.clone();
+                        pool.set_wanted(wanted.into_iter().chain(pushed_keys.iter().copied()).collect());
                         let Some(doc) = &doc else { continue };
                         for req in h.get("requests").and_then(Value::as_array).into_iter().flatten() {
                             let (Some(index), Some(k)) = (req.get("index").and_then(Value::as_u64), key(req)) else {
                                 continue;
                             };
                             let index = index as usize;
-                            if hashes.get(index) == Some(&k.hash) {
-                                pool.submit(k, doc.clone(), index);
-                            } else {
+                            let u32_field = |name: &str| req.get(name).and_then(Value::as_u64).map(|v| v as u32);
+                            let strips = match (u32_field("strip_px"), u32_field("first"), u32_field("end")) {
+                                (Some(strip_px), Some(first), Some(end)) if strip_px > 0 && first < end => {
+                                    Some(Strips { strip_px, first, end })
+                                }
+                                _ => None,
+                            };
+                            if let Some(s) = strips {
+                                strip_px = Some(s.strip_px);
+                            }
+                            if hashes.get(index) != Some(&k.hash) {
                                 // Stale request (the document changed meanwhile).
-                                send(
-                                    json!({ "type": "skipped", "hash": format!("{:x}", k.hash), "scale_milli": k.scale_milli }),
-                                    Payload::None,
-                                );
+                                send(skipped_json(&k, strips), Payload::None);
+                                continue;
+                            }
+                            match strips {
+                                Some(s) => pool.submit_strips(k, doc.clone(), index, s),
+                                None => pool.submit(k, doc.clone(), index),
                             }
                         }
                     }

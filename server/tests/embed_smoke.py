@@ -23,7 +23,10 @@ TEXT = """#set page(width: 400pt, height: auto, margin: 20pt)
 = Embedded
 
 Hello brave new world.
+
+#lorem(300)
 """
+STRIP_PX = 128
 
 
 def lsp_send(proc, msg):
@@ -105,6 +108,24 @@ def main():
     assert len(payload) == b["width"] * b["height"] * 4, "BGRA payload size"
     assert payload[3] == 255, "opaque alpha"
     print(f"✓ bitmap {b['width']}×{b['height']} in {(time.time() - t0) * 1000:.1f} ms")
+    full = payload
+
+    # The same page as strips (what Zed's pane asks for).
+    n = -(-b["height"] // STRIP_PX)
+    t0 = time.time()
+    write_frame(conn, {"type": "render", "wanted": [key], "requests": [
+        {"index": 0, **key, "strip_px": STRIP_PX, "first": 0, "end": n}]})
+    strips = {}
+    while len(strips) < n:
+        h, p = wait("bitmap")
+        assert h["strip_px"] == STRIP_PX and len(p) == h["width"] * h["height"] * 4
+        strips[h["strip"]] = p
+    dt = (time.time() - t0) * 1000
+    joined = b"".join(strips[k] for k in range(n))
+    assert len(joined) == len(full), "strips cover the page"
+    differing = sum(1 for i in range(0, len(full), 4) if full[i:i + 4] != joined[i:i + 4])
+    assert differing <= 16, f"{differing} pixels differ between strips and the full page"
+    print(f"✓ {n} strips in {dt:.1f} ms, same pixels as the full page ({differing} rounding diffs)")
 
     # Edit → new document → render: the whole keystroke path over the socket.
     lines = TEXT.splitlines()
@@ -116,10 +137,19 @@ def main():
                                       "end": {"line": 3, "character": col + 5}}, "text": "Zed"}]}})
     d, _ = wait("document")
     page = d["pages"][0]
-    key = {"hash": page["hash"], "scale_milli": scale}
-    write_frame(conn, {"type": "render", "wanted": [key], "requests": [{"index": 0, **key}]})
-    wait("bitmap")
-    print(f"✓ keystroke → new bitmap received: {(time.time() - t0) * 1000:.1f} ms")
+    assert "base" in page and page["dirty"], f"edit diffed against the previous version: {page}"
+    pushed = page.get("pushed", [])
+    assert pushed and pushed[0]["scale_milli"] == scale, f"changed strips pushed: {page}"
+    expected = set(pushed[0]["strips"])
+    assert 0 < len(expected) < n, f"only some strips are re-rendered: {expected} of {n}"
+    got = set()
+    while got != expected:
+        h, p = wait("bitmap")
+        assert h["hash"] == page["hash"], h
+        got.add(h["strip"])
+    dt = (time.time() - t0) * 1000
+    print(f"✓ keystroke → changed strips {sorted(got)} of {n} pushed without a request: {dt:.1f} ms "
+          f"(dirty bands {[[round(a), round(b)] for a, b in page['dirty']]} pt)")
 
     # Click on the heading → jump message.
     write_frame(conn, {"type": "click", "page": 0, "x": 40.0, "y": 32.0})
