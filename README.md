@@ -47,14 +47,54 @@ Zed の拡張機能 API では独自の描画ペインを作れないため、Ze
 
 ## インストール (Nix)
 
-### 1. パッチ適用済み Zed とサーバー
-
-home-manager の例:
+### home-manager モジュール
 
 ```nix
 # flake.nix の inputs
 inputs.zed-typst-livepreview.url = "github:inoyu/zed-typst-livepreview";
 
+# home.nix
+{ inputs, ... }:
+{
+  imports = [ inputs.zed-typst-livepreview.homeManagerModules.default ];
+
+  programs.typst-livepreview.enable = true;
+  programs.zed-editor.enable = true;  # Zed 自体の設定はこれまで通り
+}
+```
+
+`programs.typst-livepreview.enable = true` で次のことが行われます。
+
+- 言語サーバー `typst-livepreview` を `home.packages` に追加(PATH に置く)
+- Zed 拡張機能(`extension.toml` とビルド済みの `extension.wasm`)を Zed の拡張機能ディレクトリにコピー
+  - macOS: `~/Library/Application Support/Zed/extensions/installed/typst-livepreview`
+  - Linux: `~/.local/share/zed/extensions/installed/typst-livepreview`
+  - 中身が変わったときだけ置き換えます。Zed は起動中なら即座に、そうでなければ次回起動時に読み込みます
+- `programs.zed-editor.package` の既定値をパッチ適用済み Zed にする(`lib.mkDefault` なので、自分で指定した値が優先されます。`programs.zed-editor` 自体は有効化しません)
+
+| オプション(`programs.typst-livepreview.*`) | 既定値 | 内容 |
+| --- | --- | --- |
+| `enable` | `false` | 有効化 |
+| `package` | この flake の `typst-livepreview` | 言語サーバー |
+| `extensionPackage` | この flake の `zed-extension` | Zed 拡張機能 |
+| `zedPackage` | この flake の `zed-editor` | `programs.zed-editor.package` に設定する Zed。`null` なら設定しない |
+
+> **以前 `zed: install dev extension` でインストールしていた場合**: `installed/typst-livepreview` がこのリポジトリへのシンボリックリンクになっています。モジュールはこれを上書きせず警告を出すだけなので、一度だけ削除してから `home-manager switch` し直してください(シンボリックリンクだけが消え、リポジトリは消えません)。
+>
+> ```sh
+> rm ~/Library/Application\ Support/Zed/extensions/installed/typst-livepreview   # macOS
+> rm ~/.local/share/zed/extensions/installed/typst-livepreview                   # Linux
+> ```
+
+> パッチ適用済み Zed はバイナリキャッシュにないため、手元でソースからビルドされます。初回は 1 時間前後かかり、ビルド中に **40 GB 程度の空きディスク** が必要です。
+
+既存の Typst 拡張機能(tinymist)と併用する前提です(補完・診断は tinymist、プレビューはこの拡張機能)。
+
+### パッケージを個別に使う場合
+
+モジュールを使わずに、パッケージだけを参照することもできます(この場合、拡張機能は下の dev extension の手順で入れます)。
+
+```nix
 # home.nix
 { inputs, pkgs, ... }:
 let tlp = inputs.zed-typst-livepreview.packages.${pkgs.stdenv.hostPlatform.system}; in
@@ -64,28 +104,25 @@ let tlp = inputs.zed-typst-livepreview.packages.${pkgs.stdenv.hostPlatform.syste
 }
 ```
 
-または overlay(`overlays.default`)で `zed-editor` と `typst-livepreview` を差し替えられます。
-
-> パッチ適用済み Zed はバイナリキャッシュにないため、手元でソースからビルドされます。初回は 1 時間前後かかり、ビルド中に **40 GB 程度の空きディスク** が必要です。
+または overlay(`overlays.default`)で `zed-editor` と `typst-livepreview` を差し替えられます(拡張機能は `zed-extension-typst-livepreview`)。
 
 単体で試す場合:
 
 ```sh
 nix build .#zed-editor        # パッチ適用済み Zed → ./result
 nix build .#typst-livepreview # サーバー → ./result/bin/typst-livepreview
+nix build .#zed-extension     # 拡張機能 → ./result/{extension.toml,extension.wasm}
 ```
 
-### 2. Zed 拡張機能
+### 開発用: dev extension としてインストール
 
-Zed のコマンドパレットで `zed: install dev extension` を実行し、このリポジトリのディレクトリを選びます。
+拡張機能(`src/`)を手元で変更しながら試す場合は、Zed のコマンドパレットで `zed: install dev extension` を実行し、このリポジトリのディレクトリを選びます。home-manager モジュールがコピーした `installed/typst-livepreview` がある場合は、先にそれを削除してください(dev extension の間、モジュールは警告を出すだけで何もしません)。
 
 Zed は拡張機能を `wasm32-wasip2` 向けにビルドするので、そのターゲット入りの Rust が必要です。開発シェルに入っているので、**Zed を一度終了してから**開発シェル経由で起動してインストールしてください:
 
 ```sh
 nix develop -c zeditor .
 ```
-
-既存の Typst 拡張機能(tinymist)と併用する前提です(補完・診断は tinymist、プレビューはこの拡張機能)。
 
 ## 使い方
 

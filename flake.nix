@@ -41,6 +41,39 @@
           };
         };
 
+      # The Zed extension (src/, extension.toml): only extension.toml and the
+      # wasm component, like Zed's own `zed: install dev extension` produces.
+      mkExtension = pkgs: rust:
+        let
+          lib = pkgs.lib;
+          rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+        in
+        pkgs.stdenv.mkDerivation {
+          pname = "zed-extension-typst-livepreview";
+          version = (lib.importTOML ./extension.toml).version;
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./extension.toml ];
+          };
+          cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+          nativeBuildInputs = [ rustPlatform.cargoSetupHook rust pkgs.wasm-tools ];
+          buildPhase = ''
+            runHook preBuild
+            cargo build --release --offline --target wasm32-wasip2
+            runHook postBuild
+          '';
+          # Strip custom sections like Zed does (it keeps only `name`, `component-type:*`,
+          # `dylink.0` and the required `zed:api-version`).
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp extension.toml $out/
+            wasm-tools strip -d '^(\.debug_.*|producers|target_features|component-name)$' \
+              -o $out/extension.wasm target/wasm32-wasip2/release/zed_typst_livepreview.wasm
+            runHook postInstall
+          '';
+        };
+
       # Zed with the built-in Typst preview pane (zed-patch/).
       mkZed = zed-editor: zed-editor.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [ ./zed-patch/zed-integration.patch ];
@@ -61,7 +94,12 @@
       overlays.default = final: prev: {
         typst-livepreview = mkServer final final.rustPlatform;
         zed-editor = mkZed prev.zed-editor;
+        # nixpkgs' rustc has no wasm32-wasip2 std; the wasm is platform independent.
+        zed-extension-typst-livepreview = self.packages.${final.stdenv.hostPlatform.system}.zed-extension;
       };
+
+      homeManagerModules.default = import ./nix/home-manager.nix self;
+      homeModules.default = self.homeManagerModules.default;
     }
     // flake-utils.lib.eachDefaultSystem (system:
       let
@@ -87,6 +125,7 @@
           default = server;
           typst-livepreview = server;
           zed-editor = mkZed pkgs.zed-editor;
+          zed-extension = mkExtension pkgs rust;
         };
 
         apps.default = flake-utils.lib.mkApp { drv = server; };
