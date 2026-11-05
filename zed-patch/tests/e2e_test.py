@@ -27,7 +27,7 @@ version = "0.1.0"
 schema_version = 1
 authors = []
 description = "test"
-repository = "https://github.com/inoyu/zed-typst-livepreview"
+repository = "https://github.com/Xia7an/zed-typst-preview"
 
 [lib]
 kind = "Rust"

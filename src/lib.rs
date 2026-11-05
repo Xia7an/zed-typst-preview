@@ -7,7 +7,7 @@ use std::fs;
 use zed_extension_api::{self as zed, serde_json, settings::LspSettings, LanguageServerId, Result};
 
 const SERVER: &str = "typst-livepreview";
-const REPO: &str = "inoyu/zed-typst-livepreview";
+const REPO: &str = "Xia7an/zed-typst-preview";
 
 struct TypstLivePreview {
     cached_binary: Option<String>,

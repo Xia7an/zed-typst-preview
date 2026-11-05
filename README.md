@@ -51,7 +51,7 @@ Zed の拡張機能 API では独自の描画ペインを作れないため、Ze
 
 ```nix
 # flake.nix の inputs
-inputs.zed-typst-livepreview.url = "github:inoyu/zed-typst-livepreview";
+inputs.zed-typst-livepreview.url = "git+ssh://git@github.com/Xia7an/zed-typst-preview";  # private なので SSH で取得
 
 # home.nix
 { inputs, ... }:

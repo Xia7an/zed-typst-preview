@@ -4,7 +4,7 @@ version = "0.1.0"
 schema_version = 1
 authors = ["Inoyu <inoyu0329@gmail.com>"]
 description = "Instant, native (non-web) live preview for Typst with click-to-jump and cursor sync."
-repository = "https://github.com/inoyu/zed-typst-livepreview"
+repository = "https://github.com/Xia7an/zed-typst-preview"
 
 # Runs next to tinymist (from the Typst extension): this server only drives
 # the preview and does not publish diagnostics or completions.
