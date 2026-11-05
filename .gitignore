@@ -1,5 +1,15 @@
+# Rust build output
 /target
 /server/target
+
+# Zed writes extension.wasm here on "install dev extension"
 *.wasm
+
+# nix build output links (result, result-zed, ...)
 /result
+/result-*
+
 /.direnv
+__pycache__/
+.DS_Store
+.claude/settings.local.json
