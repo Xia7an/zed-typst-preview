@@ -143,4 +143,13 @@ CLICK=600,130 python3 -I tests/lsp_smoke.py target/release/typst-livepreview  # 
 
 デバッグ用の環境変数: `RUST_LOG=typst_livepreview=debug`(「edit → on screen」の遅延を記録)、`TYPST_LIVEPREVIEW_NO_EMBED=1`(常に別ウィンドウ)。
 
-Zed のパッチを更新するときは、`zed-patch/typst_preview` を Zed のソースの `crates/` にコピーし、`zed-integration.patch` と `cargo-lock.patch` を当てて `cargo check -p zed` してください。
+Zed のパッチを更新するときは、Zed v1.26.2 のソースの `crates/` に `zed-patch/typst_preview` をコピーし、`zed-integration.patch` と `cargo-lock.patch` を当ててから、nix のビルド環境で差分ビルドすると速いです(初回 20〜30 分、以降は 1 分程度):
+
+```sh
+nix develop /path/to/zed-typst-livepreview#zed-editor -c bash -c \
+  'unset LK_CUSTOM_WEBRTC; CARGO_PROFILE_DEV_DEBUG=0 cargo build -p zed --features gpui_platform/runtime_shaders'
+python3 -I zed-patch/tests/pane_test.py target/debug/zed /tmp/tlp-pane      # 偽サーバーでペインを試験
+python3 -I zed-patch/tests/e2e_test.py target/debug/zed <server> <extension.wasm> /tmp/tlp-e2e  # 実サーバーで通し試験
+```
+
+ペインのログは `ZED_LOG=typst_preview=debug` で `~/Library/Logs/Zed/Zed.log` に出ます。
