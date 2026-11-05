@@ -7,9 +7,9 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, SelectionEffects, ToPoint as _};
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render, RenderImage,
-    ScrollEvent, Subscription, WeakEntity, Window, canvas, div, img, point, px,
+    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageId, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Render,
+    RenderImage, ScrollEvent, StyledImage, Subscription, WeakEntity, Window, canvas, div, img, point, px,
 };
 use serde_json::{Value, json};
 use text::{Bias, PointUtf16, Unclipped};
@@ -26,8 +26,11 @@ const MARGIN: f32 = 16.0;
 const GAP: f32 = 12.0;
 /// Largest bitmap side we ask for (GPU texture limits, memory).
 const MAX_BITMAP_SIDE: f32 = 8192.0;
-/// Bitmaps kept besides the ones currently needed.
-const SPARE_IMAGES: usize = 8;
+/// Pages are rendered, sent and uploaded in horizontal strips of this many
+/// device pixels, so an edit only replaces the strips it touched.
+const STRIP_PX: u32 = 128;
+/// Strip bitmaps kept besides the ones currently needed.
+const SPARE_STRIPS: usize = 96;
 const FLASH: Duration = Duration::from_millis(900);
 
 #[derive(Clone, Debug)]
@@ -57,7 +60,35 @@ impl Marker {
 }
 
 /// Page hash + pixels per point × 1000.
-type Key = (u128, u32);
+type PageKey = (u128, u32);
+/// Page hash + pixels per point × 1000 + strip index.
+type Key = (u128, u32, u32);
+
+/// Bitmap size of a page, rounded like `typst-render` does.
+fn page_px(page: &PageInfo, scale_milli: u32) -> (u32, u32) {
+    let s = (scale_milli as f64 / 1000.0) as f32;
+    let px = |pt: f32| (s * pt).round().max(1.0) as u32;
+    (px(page.width), px(page.height))
+}
+
+/// Strips touched by the changed `bands` (pt) of a page `height_px` tall.
+/// Mirrors `diff::dirty_strips` in the server.
+fn dirty_strips(bands: &[(f64, f64)], scale_milli: u32, height_px: u32) -> Vec<u32> {
+    if height_px == 0 {
+        return Vec::new();
+    }
+    let scale = scale_milli as f64 / 1000.0;
+    let last = (height_px - 1) / STRIP_PX;
+    let mut out = Vec::new();
+    for &(y0, y1) in bands {
+        let r0 = ((y0 * scale).floor() - 1.0).max(0.0) as u32;
+        let r1 = ((y1 * scale).ceil() + 1.0).max(0.0) as u32;
+        out.extend((r0 / STRIP_PX).min(last)..=(r1 / STRIP_PX).min(last));
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
 
 /// A rectangle in content coordinates (logical px).
 #[derive(Clone, Copy)]
@@ -83,12 +114,17 @@ pub struct TypstPreviewView {
     conn: Option<(ConnId, Writer)>,
 
     pages: Vec<PageInfo>,
+    /// Strip bitmaps (+ when last needed). Strips that did not change in an
+    /// edit are shared between the old and the new page hash.
     images: HashMap<Key, (Arc<RenderImage>, u64)>,
-    shown: Vec<Option<Arc<RenderImage>>>,
+    /// Per page, the strips drawn last frame: kept on screen until their
+    /// replacements arrive, so edits and zooming never flicker.
+    shown: Vec<Vec<(Key, Arc<RenderImage>)>>,
     in_flight: HashSet<Key>,
-    last_wanted: Vec<Key>,
-    /// Images to evict from the GPU atlas on the next frame.
-    retired: Vec<Arc<RenderImage>>,
+    last_wanted: Vec<PageKey>,
+    /// Every image handed to GPUI; dropped from the GPU atlas once neither
+    /// `images` nor `shown` refers to it.
+    owned: HashMap<ImageId, Arc<RenderImage>>,
     tick: u64,
 
     /// Logical pixels per point.
@@ -255,7 +291,7 @@ impl TypstPreviewView {
             );
             cx.on_release(|this: &mut Self, cx| {
                 let conn = this.conn.as_ref().map(|(id, _)| *id);
-                for image in this.images.drain().map(|(_, (image, _))| image) {
+                for (_, image) in this.owned.drain() {
                     cx.drop_image(image, None);
                 }
                 if let Some(hub) = hub::hub(cx) {
@@ -277,7 +313,7 @@ impl TypstPreviewView {
                 shown: Vec::new(),
                 in_flight: HashSet::new(),
                 last_wanted: Vec::new(),
-                retired: Vec::new(),
+                owned: HashMap::new(),
                 tick: 0,
                 zoom: 1.0,
                 fit_width: true,
@@ -420,44 +456,51 @@ impl TypstPreviewView {
                 }
             }
             "document" => {
-                let pages: Vec<PageInfo> = header
-                    .get("pages")
-                    .and_then(Value::as_array)
-                    .map(|pages| {
-                        pages
+                let mut pages = Vec::new();
+                for p in header.get("pages").and_then(Value::as_array).into_iter().flatten() {
+                    let (Some(width), Some(height), Some(hash)) = (
+                        p.get("width").and_then(Value::as_f64),
+                        p.get("height").and_then(Value::as_f64),
+                        parse_hash(p.get("hash")),
+                    ) else {
+                        continue;
+                    };
+                    let page = PageInfo { width: width as f32, height: height as f32, hash };
+                    // An edit: reuse the strips that look the same as before.
+                    if let (Some(base), Some(dirty)) = (parse_hash(p.get("base")), p.get("dirty").and_then(Value::as_array)) {
+                        let bands: Vec<(f64, f64)> = dirty
                             .iter()
-                            .filter_map(|p| {
-                                Some(PageInfo {
-                                    width: p.get("width")?.as_f64()? as f32,
-                                    height: p.get("height")?.as_f64()? as f32,
-                                    hash: parse_hash(p.get("hash"))?,
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                            .filter_map(|b| Some((b.get(0)?.as_f64()?, b.get(1)?.as_f64()?)))
+                            .collect();
+                        self.reuse_clean_strips(base, &page, &bands);
+                    }
+                    // Strips the server is already rendering for us.
+                    for push in p.get("pushed").and_then(Value::as_array).into_iter().flatten() {
+                        let Some(scale) = push.get("scale_milli").and_then(Value::as_u64) else { continue };
+                        if push.get("strip_px").and_then(Value::as_u64) != Some(STRIP_PX as u64) {
+                            continue;
+                        }
+                        for k in push.get("strips").and_then(Value::as_array).into_iter().flatten() {
+                            if let Some(k) = k.as_u64() {
+                                self.in_flight.insert((hash, scale as u32, k as u32));
+                            }
+                        }
+                    }
+                    pages.push(page);
+                }
                 log::debug!("typst preview: document with {} pages", pages.len());
                 self.pages = pages;
                 self.error = None;
-                self.shown.resize(self.pages.len(), None);
-                // Free bitmaps of pages that no longer exist.
+                self.shown.resize(self.pages.len(), Vec::new());
+                // Forget bitmaps of page versions that no longer exist.
                 let live: HashSet<u128> = self.pages.iter().map(|p| p.hash).collect();
-                let dead: Vec<Key> = self
-                    .images
-                    .keys()
-                    .filter(|k| !live.contains(&k.0))
-                    .copied()
-                    .collect();
-                for key in dead {
-                    if let Some((image, _)) = self.images.remove(&key)
-                        && !self.shown.iter().flatten().any(|s| Arc::ptr_eq(s, &image))
-                    {
-                        self.retired.push(image);
-                    }
-                }
+                self.images.retain(|k, _| live.contains(&k.0));
                 if let Some(m) = self.pending_reveal.take() {
                     self.reveal(m, true);
                 }
+                // Ask for the new strips now rather than on the next frame.
+                self.update_zoom();
+                self.request_renders();
             }
             "status" => {
                 self.error = header
@@ -466,31 +509,45 @@ impl TypstPreviewView {
                     .map(str::to_string);
             }
             "bitmap" => {
-                let (Some(hash), Some(scale), Some(w), Some(h)) = (
+                let (Some(hash), Some(scale), Some(strip), Some(w), Some(h)) = (
                     parse_hash(header.get("hash")),
                     header.get("scale_milli").and_then(Value::as_u64),
+                    header.get("strip").and_then(Value::as_u64),
                     header.get("width").and_then(Value::as_u64),
                     header.get("height").and_then(Value::as_u64),
                 ) else {
                     return;
                 };
-                let key = (hash, scale as u32);
+                let key = (hash, scale as u32, strip as u32);
                 self.in_flight.remove(&key);
+                if !self.pages.iter().any(|p| p.hash == hash) {
+                    return; // An outdated version of a page.
+                }
                 // BGRA, as GPUI expects.
                 let Some(buffer) = image::RgbaImage::from_raw(w as u32, h as u32, payload) else {
                     return;
                 };
                 let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-                if let Some((old, _)) = self.images.insert(key, (image, self.tick)) {
-                    self.retired.push(old);
-                }
+                self.owned.insert(image.id, image.clone());
+                self.images.insert(key, (image, self.tick));
             }
             "skipped" => {
                 if let (Some(hash), Some(scale)) = (
                     parse_hash(header.get("hash")),
                     header.get("scale_milli").and_then(Value::as_u64),
                 ) {
-                    self.in_flight.remove(&(hash, scale as u32));
+                    let scale = scale as u32;
+                    match (
+                        header.get("first").and_then(Value::as_u64),
+                        header.get("end").and_then(Value::as_u64),
+                    ) {
+                        (Some(first), Some(end)) => {
+                            for k in first as u32..end as u32 {
+                                self.in_flight.remove(&(hash, scale, k));
+                            }
+                        }
+                        _ => self.in_flight.retain(|k| (k.0, k.1) != (hash, scale)),
+                    }
                 }
             }
             "cursor" => {
@@ -549,8 +606,8 @@ impl TypstPreviewView {
                 return;
             }
             "invalidate" => {
-                self.retired.extend(self.images.drain().map(|(_, (image, _))| image));
-                self.retired.extend(self.shown.iter_mut().filter_map(Option::take));
+                self.images.clear();
+                self.shown.iter_mut().for_each(Vec::clear);
                 self.in_flight.clear();
                 self.last_wanted.clear();
             }
@@ -559,10 +616,27 @@ impl TypstPreviewView {
         cx.notify();
     }
 
+    /// After an edit of a page from `base` to `page.hash`: strips outside the
+    /// changed `bands` have the same pixels, so share their bitmaps.
+    fn reuse_clean_strips(&mut self, base: u128, page: &PageInfo, bands: &[(f64, f64)]) {
+        let mut dirty: HashMap<u32, Vec<u32>> = HashMap::new();
+        let old: Vec<Key> = self.images.keys().filter(|k| k.0 == base).copied().collect();
+        for key in old {
+            let (_, scale, strip) = key;
+            let dirty = dirty
+                .entry(scale)
+                .or_insert_with(|| dirty_strips(bands, scale, page_px(page, scale).1));
+            if !dirty.contains(&strip) {
+                let image = self.images[&key].0.clone();
+                self.images.entry((page.hash, scale, strip)).or_insert((image, self.tick));
+            }
+        }
+    }
+
     fn reset_document(&mut self) {
         self.pages.clear();
-        self.retired.extend(self.images.drain().map(|(_, (image, _))| image));
-        self.retired.extend(self.shown.drain(..).flatten());
+        self.images.clear();
+        self.shown.clear();
         self.in_flight.clear();
         self.last_wanted.clear();
         self.markers.clear();
@@ -586,6 +660,13 @@ impl TypstPreviewView {
     fn fit_zoom(&self) -> f32 {
         let (w, _) = self.view_size();
         ((w - 2.0 * MARGIN) / self.max_page_width()).clamp(0.05, 20.0)
+    }
+
+    fn update_zoom(&mut self) {
+        if self.fit_width && self.bounds.is_some() && !self.pages.is_empty() {
+            self.zoom = self.fit_zoom();
+        }
+        self.clamp_scroll();
     }
 
     fn layout(&self) -> (Vec<Rect>, (f32, f32)) {
@@ -673,7 +754,7 @@ impl TypstPreviewView {
         self.clamp_scroll();
     }
 
-    fn key_for(&self, index: usize) -> Key {
+    fn key_for(&self, index: usize) -> PageKey {
         let page = &self.pages[index];
         let mut scale = self.zoom * self.scale_factor;
         let side = page.width.max(page.height) * scale;
@@ -683,82 +764,128 @@ impl TypstPreviewView {
         (page.hash, (scale * 1000.0).round() as u32)
     }
 
-    /// Asks the server for the bitmaps of visible pages (and neighbours).
-    fn request_renders(&mut self, visible: &[usize]) {
+    /// Strips of page `index` (at its current resolution) that cover the
+    /// part `top..bottom` (pt) of the page.
+    fn strip_range(&self, index: usize, top: f32, bottom: f32) -> std::ops::RangeInclusive<u32> {
+        let (_, scale) = self.key_for(index);
+        let (_, height) = page_px(&self.pages[index], scale);
+        let last = (height.max(1) - 1) / STRIP_PX;
+        let s = scale as f32 / 1000.0;
+        let strip = |pt: f32| (((pt * s).max(0.0) as u32) / STRIP_PX).min(last);
+        strip(top)..=strip(bottom)
+    }
+
+    /// Asks the server for the strips on screen, plus one screen above and
+    /// below, that are neither cached nor on their way.
+    fn request_renders(&mut self) {
         // Wait for the first layout: the zoom depends on the pane size.
-        if self.conn.is_none() || visible.is_empty() || self.bounds.is_none() {
+        if self.conn.is_none() || self.bounds.is_none() || self.pages.is_empty() {
             return;
         }
         self.tick += 1;
-        let mut indices = visible.to_vec();
-        if let Some(&first) = visible.first()
-            && first > 0
-        {
-            indices.push(first - 1);
-        }
-        if let Some(&last) = visible.last()
-            && last + 1 < self.pages.len()
-        {
-            indices.push(last + 1);
-        }
-        let wanted: Vec<Key> = indices.iter().map(|&i| self.key_for(i)).collect();
+        let (rects, _) = self.layout();
+        let (_, vh) = self.view_size();
+        let (lo, hi) = (self.scroll.y - vh, self.scroll.y + 2.0 * vh);
+        let mut wanted: Vec<PageKey> = Vec::new();
+        let mut needed: HashSet<Key> = HashSet::new();
         let mut requests = Vec::new();
-        for (&index, &key) in indices.iter().zip(&wanted) {
-            if let Some(entry) = self.images.get_mut(&key) {
-                entry.1 = self.tick;
-            } else if self.in_flight.insert(key) {
-                requests.push(json!({ "index": index, "hash": format!("{:x}", key.0), "scale_milli": key.1 }));
+        for (index, r) in rects.iter().enumerate() {
+            if r.y + r.h <= lo || r.y >= hi {
+                continue;
             }
+            let (hash, scale) = self.key_for(index);
+            wanted.push((hash, scale));
+            let mut run: Option<(u32, u32)> = None;
+            let mut flush = |run: &mut Option<(u32, u32)>| {
+                if let Some((first, end)) = run.take() {
+                    requests.push(json!({
+                        "index": index,
+                        "hash": format!("{hash:x}"),
+                        "scale_milli": scale,
+                        "strip_px": STRIP_PX,
+                        "first": first,
+                        "end": end,
+                    }));
+                }
+            };
+            for k in self.strip_range(index, (lo - r.y) / self.zoom, (hi - r.y) / self.zoom) {
+                let key = (hash, scale, k);
+                needed.insert(key);
+                if let Some(entry) = self.images.get_mut(&key) {
+                    entry.1 = self.tick;
+                    flush(&mut run);
+                } else if !self.in_flight.insert(key) {
+                    flush(&mut run);
+                } else {
+                    run = Some(run.map_or((k, k + 1), |(first, _)| (first, k + 1)));
+                }
+            }
+            flush(&mut run);
         }
         if !requests.is_empty() || wanted != self.last_wanted {
             let wanted_json: Vec<Value> = wanted
                 .iter()
                 .map(|k| json!({ "hash": format!("{:x}", k.0), "scale_milli": k.1 }))
                 .collect();
-            log::debug!("typst preview: requesting {} bitmaps", requests.len());
+            log::debug!("typst preview: requesting {} strip runs", requests.len());
             self.send(json!({ "type": "render", "wanted": wanted_json, "requests": requests }));
-            self.last_wanted = wanted.clone();
+            self.last_wanted = wanted;
         }
         // Evict least recently used bitmaps beyond what is needed.
-        if self.images.len() > wanted.len() + SPARE_IMAGES {
+        if self.images.len() > needed.len() + SPARE_STRIPS {
             let mut old: Vec<(Key, u64)> = self
                 .images
                 .iter()
-                .filter(|(k, _)| !wanted.contains(k))
+                .filter(|(k, _)| !needed.contains(k))
                 .map(|(k, (_, used))| (*k, *used))
                 .collect();
             old.sort_by_key(|&(_, used)| used);
-            let excess = self.images.len() - wanted.len() - SPARE_IMAGES;
+            let excess = self.images.len() - needed.len() - SPARE_STRIPS;
             for (key, _) in old.into_iter().take(excess) {
-                if let Some((image, _)) = self.images.remove(&key)
-                    && !self.shown.iter().flatten().any(|s| Arc::ptr_eq(s, &image))
-                {
-                    self.retired.push(image);
-                }
+                self.images.remove(&key);
             }
         }
     }
 
-    /// The best bitmap available for a page: exact, else the previous version
-    /// (shown until the new one arrives, so edits never flicker).
-    fn image_for(&mut self, index: usize) -> Option<Arc<RenderImage>> {
-        let key = self.key_for(index);
-        if let Some((image, _)) = self.images.get(&key) {
-            let image = image.clone();
-            if let Some(old) = self.shown[index].replace(image.clone())
-                && !Arc::ptr_eq(&old, &image)
-                && !self.images.values().any(|(i, _)| Arc::ptr_eq(i, &old))
-            {
-                self.retired.push(old);
+    /// The strips to draw for the part `top..bottom` (pt) of page `index`:
+    /// current ones where available, else what was shown there before (an
+    /// older version of the page, or another zoom level underneath).
+    fn strips_to_draw(&mut self, index: usize, top: f32, bottom: f32) -> Vec<(Key, Arc<RenderImage>)> {
+        let (hash, scale) = self.key_for(index);
+        let mut current = Vec::new();
+        let mut missing = false;
+        for k in self.strip_range(index, top, bottom) {
+            let fresh = self.images.get(&(hash, scale, k)).map(|(image, _)| ((hash, scale, k), image.clone()));
+            let stale = || self.shown[index].iter().find(|(key, _)| key.1 == scale && key.2 == k).cloned();
+            match fresh.or_else(stale) {
+                Some(strip) => current.push(strip),
+                None => missing = true,
             }
-            return Some(image);
         }
-        self.shown[index].clone().or_else(|| {
-            self.images
-                .iter()
-                .find(|(k, _)| k.0 == key.0)
-                .map(|(_, (image, _))| image.clone())
-        })
+        let mut strips: Vec<(Key, Arc<RenderImage>)> = Vec::new();
+        if missing {
+            strips.extend(self.shown[index].iter().filter(|(key, _)| key.1 != scale).cloned());
+        }
+        strips.extend(current);
+        self.shown[index] = strips.clone();
+        strips
+    }
+
+    /// Drops images from the GPU atlas that are neither cached nor shown.
+    fn collect_garbage(&mut self, window: &mut Window) {
+        let live: HashSet<ImageId> = self
+            .images
+            .values()
+            .map(|(image, _)| image.id)
+            .chain(self.shown.iter().flatten().map(|(_, image)| image.id))
+            .collect();
+        self.owned.retain(|id, image| {
+            let keep = live.contains(id);
+            if !keep {
+                window.drop_image(image.clone()).ok();
+            }
+            keep
+        });
     }
 
     // ------------------------------------------------------------- input
@@ -911,14 +1038,9 @@ fn jump(
 
 impl Render for TypstPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        for image in self.retired.drain(..) {
-            window.drop_image(image).ok();
-        }
+        self.collect_garbage(window);
         self.scale_factor = window.scale_factor();
-        if self.fit_width && self.bounds.is_some() && !self.pages.is_empty() {
-            self.zoom = self.fit_zoom();
-        }
-        self.clamp_scroll();
+        self.update_zoom();
 
         let (rects, _) = self.layout();
         let (_, vh) = self.view_size();
@@ -931,7 +1053,13 @@ impl Render for TypstPreviewView {
             self.bounds,
             self.pages.len()
         );
-        self.request_renders(&visible);
+        self.request_renders();
+        // Pages off screen keep nothing alive (the cache still has them).
+        for (i, shown) in self.shown.iter_mut().enumerate() {
+            if !visible.contains(&i) {
+                shown.clear();
+            }
+        }
 
         let colors = cx.theme().colors();
         let sf = self.scale_factor;
@@ -952,12 +1080,30 @@ impl Render for TypstPreviewView {
                     .bg(colors.border)
                     .into_any_element(),
             );
-            let page = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).bg(gpui::white());
-            let page = match self.image_for(i) {
-                Some(image) => page.child(img(image).size_full()),
-                None => page,
-            };
-            children.push(page.into_any_element());
+            children.push(div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).bg(gpui::white()).into_any_element());
+            let zoom = self.zoom;
+            let (top, bottom) = ((sy - r.y) / zoom, (sy + vh - r.y) / zoom);
+            for ((_, scale, k), image) in self.strips_to_draw(i, top, bottom) {
+                // Place each strip by its own resolution (older strips may
+                // come from another zoom level).
+                let s = scale as f32 / 1000.0;
+                let rows = image.size(0).height.0 as f32;
+                let y0 = snap(r.y - sy + (k * STRIP_PX) as f32 / s * zoom);
+                let y1 = snap(r.y - sy + ((k * STRIP_PX) as f32 + rows) / s * zoom).min(y + h);
+                if y1 <= y0 {
+                    continue;
+                }
+                children.push(
+                    img(image)
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y0))
+                        .w(px(w))
+                        .h(px(y1 - y0))
+                        .object_fit(ObjectFit::Fill)
+                        .into_any_element(),
+                );
+            }
         }
 
         let zoom = self.zoom;

@@ -67,8 +67,8 @@ try:
     print(f"✓ typst-livepreview started by Zed and connected to the pane host ({t:.1f}s)")
     _, t = wait_log(r"document with 1 pages", 60)
     print(f"✓ preview pane opened (auto_open) and received the compiled document ({t:.1f}s)")
-    n, t = wait_log(r"requesting 1 bitmaps", 30)
-    print(f"✓ pane requested the page bitmap")
+    n, t = wait_log(r"requesting [1-9]\d* strip runs", 30)
+    print(f"✓ pane requested the page strips")
     time.sleep(1)
     docs, _ = wait_log(r"document with \d+ pages", 1)
     # Edit on disk → Zed reloads the buffer → didChange → recompile.

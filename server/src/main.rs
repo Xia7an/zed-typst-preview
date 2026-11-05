@@ -8,6 +8,7 @@
 mod bench;
 mod config;
 mod core;
+mod diff;
 #[cfg(unix)]
 mod embed;
 mod lsp;

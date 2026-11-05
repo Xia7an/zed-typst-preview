@@ -20,13 +20,17 @@ use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::config::Config;
 use crate::core::CoreMsg;
-use crate::render::{Bitmap, RenderKey, RenderPool};
+use crate::diff::Band;
+use crate::render::{Bitmap, RenderKey, RenderPool, Strips};
 
 #[derive(Clone, Debug)]
 pub struct PageInfo {
     pub width: f64,
     pub height: f64,
     pub hash: u128,
+    /// What changed since the previous version of this page: its hash and
+    /// the bands that look different (everything else is pixel-identical).
+    pub diff: Option<(u128, Vec<Band>)>,
 }
 
 pub struct DocUpdate {
@@ -94,8 +98,9 @@ pub enum UiEvent {
     Reveal(Marker),
     ActivateEditor,
     Config(Config),
-    Rendered(RenderKey, Arc<Bitmap>),
-    RenderSkipped(RenderKey),
+    /// A rendered page, or only the rows of `Strips` of it.
+    Rendered(RenderKey, Option<Strips>, Arc<Bitmap>),
+    RenderSkipped(RenderKey, Option<Strips>),
     CoreReady(Sender<CoreMsg>),
     Exit,
 }
@@ -770,7 +775,7 @@ impl ApplicationHandler<UiEvent> for Viewer {
                 }
                 self.redraw();
             }
-            UiEvent::Rendered(key, bitmap) => {
+            UiEvent::Rendered(key, _, bitmap) => {
                 self.in_flight.remove(&key);
                 if self.win.is_none() {
                     return;
@@ -786,7 +791,7 @@ impl ApplicationHandler<UiEvent> for Viewer {
                     self.draw();
                 }
             }
-            UiEvent::RenderSkipped(key) => {
+            UiEvent::RenderSkipped(key, _) => {
                 // Re-request it if it became visible again in the meantime.
                 if self.in_flight.remove(&key) {
                     self.redraw();

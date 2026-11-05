@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 
 /// `/tmp/zed-typst-preview-<uid>/<zed pid>.sock`. Language servers are child
 /// processes of Zed, so they find it through their parent pid.

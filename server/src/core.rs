@@ -24,6 +24,7 @@ use typst_kit::fonts::FontStore;
 use typst_layout::PagedDocument;
 
 use crate::config::Config;
+use crate::diff;
 use crate::position;
 use crate::viewer::{DocUpdate, Marker, PageInfo, Status, UiEvent, UiSender};
 use crate::world::{self, PreviewWorld};
@@ -398,16 +399,22 @@ impl Core {
 
         match warned.output {
             Ok(doc) => {
+                let prev = self.doc.clone();
                 let pages: Vec<PageInfo> = doc
                     .pages()
                     .iter()
-                    .map(|p| {
+                    .enumerate()
+                    .map(|(i, p)| {
                         let size = p.frame.size();
-                        PageInfo {
-                            width: size.x.to_pt(),
-                            height: size.y.to_pt(),
-                            hash: typst::utils::hash128(&(&p.frame, &p.fill)),
-                        }
+                        let hash = typst::utils::hash128(&(&p.frame, &p.fill));
+                        // Changed page: find out which parts of it changed.
+                        let diff = match (self.last_hashes.get(i), prev.as_ref().and_then(|d| d.pages().get(i))) {
+                            (Some(&old_hash), Some(old)) if old_hash != hash => {
+                                diff::dirty_bands(old, p).map(|bands| (old_hash, bands))
+                            }
+                            _ => None,
+                        };
+                        PageInfo { width: size.x.to_pt(), height: size.y.to_pt(), hash, diff }
                     })
                     .collect();
                 let status = Status { error: None, warnings: warned.warnings.len(), compile_ms: elapsed.as_secs_f64() * 1000.0 };
