@@ -1,0 +1,174 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7f2a220..3c676c1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -206,6 +206,7 @@ members = [
+     "crates/streaming_diff",
+     "crates/sum_tree",
+     "crates/svg_preview",
++    "crates/typst_preview",
+     "crates/syntax_theme",
+     "crates/system_specs",
+     "crates/tab_switcher",
+@@ -478,6 +479,7 @@ sqlez_macros = { path = "crates/sqlez_macros" }
+ streaming_diff = { path = "crates/streaming_diff" }
+ sum_tree = { path = "crates/sum_tree" }
+ svg_preview = { path = "crates/svg_preview" }
++typst_preview = { path = "crates/typst_preview" }
+ syntax_theme = { path = "crates/syntax_theme" }
+ system_specs = { path = "crates/system_specs" }
+ tab_switcher = { path = "crates/tab_switcher" }
+diff --git a/assets/keymaps/default-linux.json b/assets/keymaps/default-linux.json
+index d436da4..09dd0af 100644
+--- a/assets/keymaps/default-linux.json
++++ b/assets/keymaps/default-linux.json
+@@ -1629,6 +1629,15 @@
+       "ctrl-k": "branch_picker::ToggleFilterMenu",
+     },
+   },
++  {
++    "context": "TypstPreview",
++    "bindings": {
++      "ctrl-=": "typst_preview::ZoomIn",
++      "ctrl-+": "typst_preview::ZoomIn",
++      "ctrl--": "typst_preview::ZoomOut",
++      "ctrl-0": "typst_preview::FitWidth",
++    },
++  },
+   {
+     "context": "ImageViewer",
+     "bindings": {
+diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
+index e4d0fe5..d216a38 100644
+--- a/assets/keymaps/default-macos.json
++++ b/assets/keymaps/default-macos.json
+@@ -1680,6 +1680,15 @@
+       "cmd-k": "branch_picker::ToggleFilterMenu",
+     },
+   },
++  {
++    "context": "TypstPreview",
++    "bindings": {
++      "cmd-=": "typst_preview::ZoomIn",
++      "cmd-+": "typst_preview::ZoomIn",
++      "cmd--": "typst_preview::ZoomOut",
++      "cmd-0": "typst_preview::FitWidth",
++    },
++  },
+   {
+     "context": "ImageViewer",
+     "use_key_equivalents": true,
+diff --git a/assets/keymaps/default-windows.json b/assets/keymaps/default-windows.json
+index 6632780..b09babc 100644
+--- a/assets/keymaps/default-windows.json
++++ b/assets/keymaps/default-windows.json
+@@ -1604,6 +1604,15 @@
+       "ctrl-k": "branch_picker::ToggleFilterMenu",
+     },
+   },
++  {
++    "context": "TypstPreview",
++    "bindings": {
++      "ctrl-=": "typst_preview::ZoomIn",
++      "ctrl-+": "typst_preview::ZoomIn",
++      "ctrl--": "typst_preview::ZoomOut",
++      "ctrl-0": "typst_preview::FitWidth",
++    },
++  },
+   {
+     "context": "ImageViewer",
+     "bindings": {
+diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
+index 496e016..a8df01e 100644
+--- a/crates/zed/Cargo.toml
++++ b/crates/zed/Cargo.toml
+@@ -201,6 +201,7 @@ smol.workspace = true
+ snippet_provider.workspace = true
+ snippets_ui.workspace = true
+ svg_preview.workspace = true
++typst_preview.workspace = true
+ sysinfo.workspace = true
+ tab_switcher.workspace = true
+ tasks_ui.workspace = true
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index c3bde91..6364175 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -778,6 +778,7 @@ fn main() {
+         markdown_preview::init(cx);
+         tabular_data_preview::init(cx);
+         svg_preview::init(cx);
++        typst_preview::init(cx);
+         onboarding::init(cx);
+         settings_ui::init(cx);
+         keymap_editor::init(cx);
+diff --git a/crates/zed/src/zed/quick_action_bar/preview.rs b/crates/zed/src/zed/quick_action_bar/preview.rs
+index 96b38d0..60f82e4 100644
+--- a/crates/zed/src/zed/quick_action_bar/preview.rs
++++ b/crates/zed/src/zed/quick_action_bar/preview.rs
+@@ -3,6 +3,7 @@ use gpui::{AnyElement, Entity, Modifiers};
+ use markdown_preview::markdown_preview_view::MarkdownPreviewView;
+ use svg_preview::svg_preview_view::SvgPreviewView;
+ use tabular_data_preview::TabularDataPreviewPane;
++use typst_preview::TypstPreviewView;
+ use ui::{Tooltip, prelude::*, text_for_keystroke};
+ 
+ use super::QuickActionBar;
+@@ -11,6 +12,7 @@ enum PreviewTarget {
+     Markdown(Entity<Editor>),
+     Svg(Entity<MultiBuffer>),
+     TabularData(Entity<Editor>),
++    Typst(Entity<Editor>),
+ }
+ 
+ impl QuickActionBar {
+@@ -29,10 +31,14 @@ impl QuickActionBar {
+             && SvgPreviewView::is_svg_file(&buffer, cx)
+         {
+             PreviewTarget::Svg(buffer)
++        } else if let Some(editor) = editor.as_ref()
++            && TabularDataPreviewPane::is_tabular_data_file(editor, cx)
++        {
++            PreviewTarget::TabularData(editor.clone())
+         } else if let Some(editor) = editor
+-            && TabularDataPreviewPane::is_tabular_data_file(&editor, cx)
++            && TypstPreviewView::is_typst_editor(&editor, cx)
+         {
+-            PreviewTarget::TabularData(editor)
++            PreviewTarget::Typst(editor)
+         } else {
+             return None;
+         };
+@@ -53,6 +59,11 @@ impl QuickActionBar {
+                 "Preview Tabular Data",
+                 &tabular_data_preview::OpenPreview as &dyn gpui::Action,
+             ),
++            PreviewTarget::Typst(_) => (
++                "toggle-typst-preview",
++                "Preview Typst (opens in a split)",
++                &typst_preview::OpenPreviewToTheSide as &dyn gpui::Action,
++            ),
+         };
+ 
+         let alt_click = gpui::Keystroke {
+@@ -112,6 +123,20 @@ impl QuickActionBar {
+                                     );
+                                 }
+                             }
++                            PreviewTarget::Typst(editor) => {
++                                // Like VS Code, the preview opens beside the
++                                // source; alt-click opens it in this pane.
++                                if let Some(path) = TypstPreviewView::editor_path(editor, cx) {
++                                    TypstPreviewView::open(
++                                        workspace,
++                                        path,
++                                        pane,
++                                        !open_to_the_side,
++                                        window,
++                                        cx,
++                                    );
++                                }
++                            }
+                             PreviewTarget::TabularData(editor) => {
+                                 let editor = editor.clone();
+                                 if open_to_the_side {

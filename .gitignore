@@ -1,0 +1,5 @@
+/target
+/server/target
+*.wasm
+/result
+/.direnv
