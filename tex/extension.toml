@@ -1,0 +1,32 @@
+id = "tex-livepreview"
+name = "TeX Live Preview"
+version = "0.1.0"
+schema_version = 1
+authors = ["Inoyu <inoyu0329@gmail.com>"]
+description = "Native (non-web) live preview for LaTeX with click-to-jump and cursor sync. Needs Zed with the preview pane patch."
+repository = "https://github.com/Xia7an/zed-typst-preview"
+
+# Runs next to texlab (from the LaTeX extension, which also provides the
+# "LaTeX" language): this server only drives the preview.
+[language_servers.tex-livepreview]
+name = "TeX Live Preview"
+languages = ["LaTeX"]
+
+# Editor toolbar buttons for .tex files (patched Zed: zed-patch/extension_toolbar).
+# A click runs `command` on the language server, with [file URI, {"modifiers": {...}}].
+[[toolbar_buttons]]
+id = "export-pdf"
+icon = "file_doc"
+tooltip = "Export PDF"
+languages = ["LaTeX"]
+language_server = "tex-livepreview"
+command = "tex-livepreview.exportPdf"
+
+[[toolbar_buttons]]
+id = "preview"
+icon = "eye"
+tooltip = "Preview LaTeX (opens in a split)"
+alt_tooltip = "open in this pane"
+languages = ["LaTeX"]
+language_server = "tex-livepreview"
+command = "tex-livepreview.open"
