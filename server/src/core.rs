@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use typst::WorldExt;
-use typst::diag::Severity;
+use typst::diag::{Severity, SourceDiagnostic};
 use typst::introspection::PagedPosition;
 use typst::layout::{Abs, Frame, FrameItem, Point, Transform};
 use typst::syntax::{LinkedNode, Side, Source, Span, SyntaxKind};
@@ -44,7 +44,12 @@ pub enum CoreMsg {
     FilesChanged,
     Cursor { path: PathBuf, line: u32, character: u32 },
     /// Explicitly open the preview (optionally for a specific file).
-    OpenPreview { path: Option<PathBuf> },
+    /// `split`: next to the editor (else in its pane). `explicit`: the user
+    /// asked for it, so reveal the preview even if it is already open.
+    OpenPreview { path: Option<PathBuf>, split: bool, explicit: bool },
+    /// Compile the document of `path` (or the current one) and write it as
+    /// a PDF next to the main file. Replies with the PDF path.
+    ExportPdf { path: Option<PathBuf>, reply: Sender<Result<PathBuf, String>> },
     WindowClosed,
     /// A preview pane inside the editor was opened for `path`.
     Attach { path: PathBuf },
@@ -117,6 +122,23 @@ pub fn spawn(
 
 fn is_typst(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "typ")
+}
+
+/// `file:line:col: message` of the first error (or diagnostic).
+fn first_error_message(world: &PreviewWorld, diags: &[SourceDiagnostic]) -> Option<String> {
+    let first = diags.iter().find(|e| e.severity == Severity::Error).or(diags.first())?;
+    let loc = first
+        .span
+        .id()
+        .and_then(|id| {
+            let src = world.source(id).ok()?;
+            let range = world.range(first.span)?;
+            let (line, col) = position::to_position(&src, range.start);
+            let name = id.vpath().file_name().unwrap_or("").to_string();
+            Some(format!("{name}:{}:{}: ", line + 1, col + 1))
+        })
+        .unwrap_or_default();
+    Some(format!("{loc}{}", first.message))
 }
 
 impl Core {
@@ -204,7 +226,7 @@ impl Core {
                     self.retarget(&path);
                     if self.cfg.auto_open && !self.first_open_done {
                         self.first_open_done = true;
-                        self.show_window();
+                        self.show_window(true, false);
                     }
                 }
             }
@@ -249,18 +271,13 @@ impl Core {
                     self.cursor_changed = true;
                 }
             }
-            CoreMsg::OpenPreview { path } => {
-                if let Some(path) = path.filter(|p| is_typst(p)) {
-                    if self.cfg.main.is_none() && self.target.as_ref() != Some(&path) && !self.deps.contains(&path) {
-                        self.retarget(&path);
-                    }
-                }
-                if self.target.is_none() {
-                    if let Some(p) = self.open_paths.iter().find(|p| is_typst(p)).cloned() {
-                        self.retarget(&p);
-                    }
-                }
-                self.show_window();
+            CoreMsg::OpenPreview { path, split, explicit } => {
+                self.target_for_request(path);
+                self.show_window(split, explicit);
+            }
+            CoreMsg::ExportPdf { path, reply } => {
+                self.target_for_request(path);
+                let _ = reply.send(self.export_pdf());
             }
             CoreMsg::Attach { path } => {
                 if self.cfg.main.is_none() && is_typst(&path) && self.target.as_ref() != Some(&path) && !self.deps.contains(&path) {
@@ -310,6 +327,50 @@ impl Core {
             CoreMsg::Shutdown => return false,
         }
         true
+    }
+
+    /// Picks the document for an explicit request about `path`: `path`
+    /// itself unless the main file is pinned or `path` is part of the
+    /// current document; else any open Typst file.
+    fn target_for_request(&mut self, path: Option<PathBuf>) {
+        if let Some(path) = path.filter(|p| is_typst(p)) {
+            if self.cfg.main.is_none() && self.target.as_ref() != Some(&path) && !self.deps.contains(&path) {
+                self.retarget(&path);
+            }
+        }
+        if self.target.is_none() {
+            if let Some(p) = self.open_paths.iter().find(|p| is_typst(p)).cloned() {
+                self.retarget(&p);
+            }
+        }
+    }
+
+    /// Compiles the current document (with unsaved edits) and writes
+    /// `<main>.pdf` next to the main file.
+    fn export_pdf(&mut self) -> Result<PathBuf, String> {
+        let Some(main) = self.target.clone() else {
+            return Err("no Typst document to export".into());
+        };
+        let world = self.world();
+        world.begin_revision();
+        let start = Instant::now();
+        let warned = typst::compile::<PagedDocument>(&*world);
+        let doc = match warned.output {
+            Ok(doc) => doc,
+            Err(errors) => {
+                let world = self.world.as_ref().unwrap();
+                let message = first_error_message(world, &errors).unwrap_or_default();
+                return Err(format!("compilation failed: {message}"));
+            }
+        };
+        let bytes = typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default()).map_err(|errors| {
+            let world = self.world.as_ref().unwrap();
+            format!("PDF export failed: {}", first_error_message(world, &errors).unwrap_or_default())
+        })?;
+        let out = main.with_extension("pdf");
+        std::fs::write(&out, bytes).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+        log::info!("exported {} in {:?}", out.display(), start.elapsed());
+        Ok(out)
     }
 
     /// The editor is active in `path`: follow it unless pinned, or it's part
@@ -378,12 +439,18 @@ impl Core {
         }
     }
 
-    fn show_window(&mut self) {
+    fn show_window(&mut self, split: bool, explicit: bool) {
         self.window_open = true;
         self.shared.window_open.store(true, Ordering::Relaxed);
         self.dirty = true;
         self.cursor_changed = true;
-        let _ = self.ui.send_event(UiEvent::Show { title: self.title(), cfg: self.cfg.clone(), path: self.target.clone() });
+        let _ = self.ui.send_event(UiEvent::Show {
+            title: self.title(),
+            cfg: self.cfg.clone(),
+            path: self.target.clone(),
+            split,
+            explicit,
+        });
     }
 
     fn compile(&mut self) {
@@ -448,21 +515,7 @@ impl Core {
                     self.deps.extend(deps);
                 }
                 let world = self.world.as_ref().unwrap();
-                let first = errors.iter().find(|e| e.severity == Severity::Error).or(errors.first());
-                let message = first.map(|e| {
-                    let loc = e
-                        .span
-                        .id()
-                        .and_then(|id| {
-                            let src = world.source(id).ok()?;
-                            let range = world.range(e.span)?;
-                            let (line, col) = position::to_position(&src, range.start);
-                            let name = id.vpath().file_name().unwrap_or("").to_string();
-                            Some(format!("{name}:{}:{}: ", line + 1, col + 1))
-                        })
-                        .unwrap_or_default();
-                    format!("{loc}{}", e.message)
-                });
+                let message = first_error_message(world, &errors);
                 log::debug!("compile error: {message:?}");
                 let _ = self.ui.send_event(UiEvent::Status(Status {
                     error: Some((errors.len(), message.unwrap_or_default())),

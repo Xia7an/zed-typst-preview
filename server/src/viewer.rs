@@ -80,8 +80,9 @@ impl UiSender {
 }
 
 pub enum UiEvent {
-    /// Open the preview for `path`.
-    Show { title: String, cfg: Config, path: Option<std::path::PathBuf> },
+    /// Open the preview for `path`. In Zed: `split` opens it next to the
+    /// editor (else in the editor's pane), `explicit` reveals an open one.
+    Show { title: String, cfg: Config, path: Option<std::path::PathBuf>, split: bool, explicit: bool },
     /// The previewed file changed.
     Title { title: String, path: std::path::PathBuf },
     /// Workspace roots of this server (used by Zed to route panes).

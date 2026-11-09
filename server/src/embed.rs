@@ -193,9 +193,12 @@ pub fn run(stream: UnixStream) {
     for msg in rx {
         match msg {
             In::Ui(event) => match event {
-                UiEvent::Show { path, .. } => {
+                UiEvent::Show { path, split, explicit, .. } => {
                     if let Some(path) = path {
-                        send(json!({ "type": "open_preview", "path": path }), Payload::None);
+                        send(
+                            json!({ "type": "open_preview", "path": path, "split": split, "explicit": explicit }),
+                            Payload::None,
+                        );
                     }
                 }
                 UiEvent::Title { title, path } => {

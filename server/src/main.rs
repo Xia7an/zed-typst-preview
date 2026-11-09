@@ -96,7 +96,7 @@ fn main() {
             Default::default(),
         );
         watch_file(path.clone(), core.clone());
-        let _ = core.send(CoreMsg::OpenPreview { path: Some(path) });
+        let _ = core.send(CoreMsg::OpenPreview { path: Some(path), split: true, explicit: true });
         Viewer::new(proxy, Some(core), cfg)
     } else {
         let lsp_proxy = proxy.clone();

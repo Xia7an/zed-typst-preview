@@ -11,3 +11,24 @@ repository = "https://github.com/Xia7an/zed-typst-preview"
 [language_servers.typst-livepreview]
 name = "Typst Live Preview"
 languages = ["Typst"]
+
+# Editor toolbar buttons for .typ files (patched Zed: zed-patch/extension_toolbar;
+# other Zed versions ignore this table). From left to right. A click runs
+# `command` on the language server, with [file URI, {"modifiers": {...}}].
+# Without the patch, both are available as code actions (Cmd+.).
+[[toolbar_buttons]]
+id = "export-pdf"
+icon = "file_doc"
+tooltip = "Export PDF"
+languages = ["Typst"]
+language_server = "typst-livepreview"
+command = "typst-livepreview.exportPdf"
+
+[[toolbar_buttons]]
+id = "preview"
+icon = "eye"
+tooltip = "Preview Typst (opens in a split)"
+alt_tooltip = "open in this pane"
+languages = ["Typst"]
+language_server = "typst-livepreview"
+command = "typst-livepreview.open"

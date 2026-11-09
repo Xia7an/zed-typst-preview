@@ -29,7 +29,7 @@ points (pt), from the top-left of a page; pages are 0-based.
 | -------------- | ---------------------------------------------------------------------- |
 | `hello`        | `version`, `pid`                                                       |
 | `roots`        | `roots`: workspace folders (used to route panes to servers)            |
-| `open_preview` | `path`: user asked for a preview (code action / `auto_open`)          |
+| `open_preview` | `path`: user asked for a preview (toolbar button / code action / `auto_open`); `split` (default `true`): next to the active pane, else in it; `explicit` (default `false`): reveal the preview even if one is open |
 | `target`       | `path`, `title`: the previewed main file changed                       |
 | `document`     | `generation`, `pages: [page]` (below), `compile_ms`, `warnings`        |
 | `status`       | `error` (first message or null), `errors`, `compile_ms`, `warnings`    |

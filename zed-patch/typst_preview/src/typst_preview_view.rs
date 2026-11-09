@@ -185,12 +185,7 @@ impl TypstPreviewView {
         is_typst(&path).then(|| (path, workspace.active_pane().clone()))
     }
 
-    /// The file shown by `editor`, if it is a local file.
-    pub fn editor_path(editor: &Entity<Editor>, cx: &App) -> Option<PathBuf> {
-        editor_path(editor, cx)
-    }
-
-    pub fn is_typst_editor(editor: &Entity<Editor>, cx: &App) -> bool {
+    fn is_typst_editor(editor: &Entity<Editor>, cx: &App) -> bool {
         editor_path(editor, cx).is_some_and(|p| is_typst(&p))
     }
 
@@ -230,9 +225,10 @@ impl TypstPreviewView {
         }
     }
 
-    /// Opens a preview requested by the language server (a code action or
-    /// `auto_open`), in the window whose project contains `path`.
-    pub(crate) fn open_for_path(path: PathBuf, cx: &mut App) {
+    /// Opens a preview requested by the language server (a toolbar button,
+    /// a code action or `auto_open`), in the window whose project contains
+    /// `path`: next to the active pane if `split`, else in it.
+    pub(crate) fn open_for_path(path: PathBuf, split: bool, cx: &mut App) {
         let target = canonical(&path);
         for window in cx.windows() {
             let Some(multi) = window.downcast::<MultiWorkspace>() else {
@@ -251,7 +247,7 @@ impl TypstPreviewView {
                         if contains {
                             workspace.update(cx, |workspace, cx| {
                                 let origin = workspace.active_pane().clone();
-                                Self::open(workspace, path.clone(), origin, true, window, cx);
+                                Self::open(workspace, path.clone(), origin, split, window, cx);
                             });
                             return true;
                         }

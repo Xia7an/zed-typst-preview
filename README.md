@@ -51,7 +51,7 @@ Zed (パッチ適用済み)                         typst-livepreview (言語サ
 | ディレクトリ | 内容 |
 | --- | --- |
 | `server/` | 言語サーバー兼レンダラ `typst-livepreview`(Rust, ネイティブ) |
-| `zed-patch/` | Zed に Typst プレビューペインを追加するパッチ(`typst_preview` クレート) |
+| `zed-patch/` | Zed へのパッチ: Typst プレビューペイン(`typst_preview`)と、拡張機能が宣言するツールバーボタン(`extension_toolbar`) |
 | `src/`, `extension.toml` | Zed 拡張機能(言語サーバーを起動するだけの WASM) |
 | `flake.nix` | ビルドに必要なツール一式・サーバー・パッチ適用済み Zed |
 | `docs/PROTOCOL.md` | Zed のペインとサーバー間のプロトコル |
@@ -142,6 +142,7 @@ nix develop -c zeditor .
 | 操作 | 方法 |
 | --- | --- |
 | プレビューを開く | `.typ` を開いてツールバーの 👁 ボタン(分割で開く / Alt+クリックで同じペイン)、コマンドパレットの `typst preview: open preview to the side`、またはコードアクション(`Cmd+.`)の **Open Typst Live Preview** |
+| PDF を書き出す | ツールバーの PDF ボタン(👁 の左)。メインファイルの隣に `<メインファイル名>.pdf` を書き出します(保存前の編集も反映)。パッチなしの Zed ではコードアクションの **Export PDF** |
 | ソースへジャンプ | プレビューをクリック |
 | スクロール | ホイール / トラックパッド / ドラッグ / 矢印・PageUp/Down・Space |
 | ズーム | `Cmd` + ホイール、ピンチ、`Cmd +` / `Cmd -`、`Cmd 0`(幅に合わせる) |
@@ -193,7 +194,7 @@ CLICK=600,130 python3 -I tests/lsp_smoke.py target/release/typst-livepreview  # 
 
 デバッグ用の環境変数: `RUST_LOG=typst_livepreview=debug`(「edit → on screen」の遅延を記録)、`TYPST_LIVEPREVIEW_NO_EMBED=1`(常に別ウィンドウ)。
 
-Zed のパッチを更新するときは、Zed v1.26.2 のソースの `crates/` に `zed-patch/typst_preview` をコピーし、`zed-integration.patch` と `cargo-lock.patch` を当ててから、nix のビルド環境で差分ビルドすると速いです(初回 20〜30 分、以降は 1 分程度):
+Zed のパッチを更新するときは、Zed v1.26.2 のソースの `crates/` に `zed-patch/typst_preview` と `zed-patch/extension_toolbar` をコピーし、`zed-integration.patch` と `cargo-lock.patch` を当ててから、nix のビルド環境で差分ビルドすると速いです(初回 20〜30 分、以降は 1 分程度):
 
 ```sh
 nix develop /path/to/zed-typst-livepreview#zed-editor -c bash -c \

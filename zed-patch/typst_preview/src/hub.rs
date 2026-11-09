@@ -196,9 +196,14 @@ impl Hub {
                     "open_preview" => {
                         if let Some(path) = header.get("path").and_then(Value::as_str) {
                             let path = PathBuf::from(path);
+                            // `split`: next to the editor, else in its pane.
+                            // `explicit`: the user asked (toolbar button), so
+                            // reveal the preview even if it is open.
+                            let split = header.get("split").and_then(Value::as_bool).unwrap_or(true);
+                            let explicit = header.get("explicit").and_then(Value::as_bool).unwrap_or(false);
                             let has_view = self.live_views().iter().any(|v| v.read(cx).conn() == Some(id));
-                            if !has_view {
-                                cx.defer(move |cx| TypstPreviewView::open_for_path(path, cx));
+                            if explicit || !has_view {
+                                cx.defer(move |cx| TypstPreviewView::open_for_path(path, split, cx));
                             }
                         }
                     }
