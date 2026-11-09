@@ -1,12 +1,12 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 7f2a220..5c25713 100644
+index 7f2a220..1a7971a 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -206,6 +206,8 @@ members = [
      "crates/streaming_diff",
      "crates/sum_tree",
      "crates/svg_preview",
-+    "crates/typst_preview",
++    "crates/external_preview",
 +    "crates/extension_toolbar",
      "crates/syntax_theme",
      "crates/system_specs",
@@ -15,13 +15,13 @@ index 7f2a220..5c25713 100644
  streaming_diff = { path = "crates/streaming_diff" }
  sum_tree = { path = "crates/sum_tree" }
  svg_preview = { path = "crates/svg_preview" }
-+typst_preview = { path = "crates/typst_preview" }
++external_preview = { path = "crates/external_preview" }
 +extension_toolbar = { path = "crates/extension_toolbar" }
  syntax_theme = { path = "crates/syntax_theme" }
  system_specs = { path = "crates/system_specs" }
  tab_switcher = { path = "crates/tab_switcher" }
 diff --git a/assets/keymaps/default-linux.json b/assets/keymaps/default-linux.json
-index d436da4..09dd0af 100644
+index d436da4..4860efb 100644
 --- a/assets/keymaps/default-linux.json
 +++ b/assets/keymaps/default-linux.json
 @@ -1629,6 +1629,15 @@
@@ -29,19 +29,19 @@ index d436da4..09dd0af 100644
      },
    },
 +  {
-+    "context": "TypstPreview",
++    "context": "ExternalPreview",
 +    "bindings": {
-+      "ctrl-=": "typst_preview::ZoomIn",
-+      "ctrl-+": "typst_preview::ZoomIn",
-+      "ctrl--": "typst_preview::ZoomOut",
-+      "ctrl-0": "typst_preview::FitWidth",
++      "ctrl-=": "external_preview::ZoomIn",
++      "ctrl-+": "external_preview::ZoomIn",
++      "ctrl--": "external_preview::ZoomOut",
++      "ctrl-0": "external_preview::FitWidth",
 +    },
 +  },
    {
      "context": "ImageViewer",
      "bindings": {
 diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
-index e4d0fe5..d216a38 100644
+index e4d0fe5..3c1a4e3 100644
 --- a/assets/keymaps/default-macos.json
 +++ b/assets/keymaps/default-macos.json
 @@ -1680,6 +1680,15 @@
@@ -49,19 +49,19 @@ index e4d0fe5..d216a38 100644
      },
    },
 +  {
-+    "context": "TypstPreview",
++    "context": "ExternalPreview",
 +    "bindings": {
-+      "cmd-=": "typst_preview::ZoomIn",
-+      "cmd-+": "typst_preview::ZoomIn",
-+      "cmd--": "typst_preview::ZoomOut",
-+      "cmd-0": "typst_preview::FitWidth",
++      "cmd-=": "external_preview::ZoomIn",
++      "cmd-+": "external_preview::ZoomIn",
++      "cmd--": "external_preview::ZoomOut",
++      "cmd-0": "external_preview::FitWidth",
 +    },
 +  },
    {
      "context": "ImageViewer",
      "use_key_equivalents": true,
 diff --git a/assets/keymaps/default-windows.json b/assets/keymaps/default-windows.json
-index 6632780..b09babc 100644
+index 6632780..23ed88a 100644
 --- a/assets/keymaps/default-windows.json
 +++ b/assets/keymaps/default-windows.json
 @@ -1604,6 +1604,15 @@
@@ -69,39 +69,39 @@ index 6632780..b09babc 100644
      },
    },
 +  {
-+    "context": "TypstPreview",
++    "context": "ExternalPreview",
 +    "bindings": {
-+      "ctrl-=": "typst_preview::ZoomIn",
-+      "ctrl-+": "typst_preview::ZoomIn",
-+      "ctrl--": "typst_preview::ZoomOut",
-+      "ctrl-0": "typst_preview::FitWidth",
++      "ctrl-=": "external_preview::ZoomIn",
++      "ctrl-+": "external_preview::ZoomIn",
++      "ctrl--": "external_preview::ZoomOut",
++      "ctrl-0": "external_preview::FitWidth",
 +    },
 +  },
    {
      "context": "ImageViewer",
      "bindings": {
 diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
-index 496e016..0fdd005 100644
+index 496e016..256f0fe 100644
 --- a/crates/zed/Cargo.toml
 +++ b/crates/zed/Cargo.toml
 @@ -201,6 +201,8 @@ smol.workspace = true
  snippet_provider.workspace = true
  snippets_ui.workspace = true
  svg_preview.workspace = true
-+typst_preview.workspace = true
++external_preview.workspace = true
 +extension_toolbar.workspace = true
  sysinfo.workspace = true
  tab_switcher.workspace = true
  tasks_ui.workspace = true
 diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
-index c3bde91..9142ed5 100644
+index c3bde91..5b941ec 100644
 --- a/crates/zed/src/main.rs
 +++ b/crates/zed/src/main.rs
 @@ -778,6 +778,8 @@ fn main() {
          markdown_preview::init(cx);
          tabular_data_preview::init(cx);
          svg_preview::init(cx);
-+        typst_preview::init(cx);
++        external_preview::init(cx);
 +        extension_toolbar::init(cx);
          onboarding::init(cx);
          settings_ui::init(cx);

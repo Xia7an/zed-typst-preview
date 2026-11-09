@@ -1,5 +1,9 @@
-//! Hosts the socket that `typst-livepreview` servers connect to, and routes
-//! messages between servers and preview panes.
+//! Hosts the socket that preview servers connect to, and routes messages
+//! between servers and preview panes.
+//!
+//! Each server says in its `hello` which kind of document it renders and for
+//! which file extensions. A pane shows one kind and is bound to the server of
+//! that kind whose workspace root contains the previewed file.
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter};
@@ -11,7 +15,7 @@ use std::sync::mpsc;
 use gpui::{App, AppContext as _, Context, Entity, Global, WeakEntity};
 use serde_json::{Value, json};
 
-use crate::TypstPreviewView;
+use crate::ExternalPreviewView;
 use crate::protocol::{self, read_frame, write_frame};
 
 pub(crate) type ConnId = u64;
@@ -23,15 +27,90 @@ enum HubEvent {
     Disconnected(ConnId),
 }
 
+/// How a server lays out its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// The server decides the page sizes (Typst, PDF); zooming scales them.
+    Fixed,
+    /// The server lays out the document to the pane width it is told about
+    /// (`viewport` messages), like a web page.
+    Reflow,
+}
+
+/// What a server renders, from its `hello`.
+#[derive(Clone, Debug)]
+pub(crate) struct ServerInfo {
+    pub kind: String,
+    pub name: String,
+    /// Lowercase, without the dot.
+    pub extensions: Vec<String>,
+    pub layout: Layout,
+}
+
+impl ServerInfo {
+    /// Protocol v2 servers (`typst-livepreview` before v3) do not say.
+    fn typst() -> Self {
+        Self {
+            kind: "typst".into(),
+            name: "Typst".into(),
+            extensions: vec!["typ".into()],
+            layout: Layout::Fixed,
+        }
+    }
+
+    fn from_hello(header: &Value) -> Self {
+        let Some(kind) = header.get("kind").and_then(Value::as_str) else {
+            return Self::typst();
+        };
+        let extensions = header
+            .get("extensions")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|e| e.trim_start_matches('.').to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let layout = match header.get("layout").and_then(Value::as_str) {
+            Some("reflow") => Layout::Reflow,
+            _ => Layout::Fixed,
+        };
+        Self {
+            kind: kind.to_string(),
+            name: header
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(kind)
+                .to_string(),
+            extensions,
+            layout,
+        }
+    }
+
+    pub fn handles(&self, path: &Path) -> bool {
+        handles(&self.extensions, path)
+    }
+}
+
+/// Whether `path` has one of `extensions` (lowercase, without the dot).
+pub(crate) fn handles(extensions: &[String], path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
 struct Conn {
     roots: Vec<PathBuf>,
     writer: mpsc::Sender<Value>,
+    /// Known once the server said `hello`.
+    info: Option<ServerInfo>,
 }
 
 #[derive(Default)]
 pub(crate) struct Hub {
     conns: BTreeMap<ConnId, Conn>,
-    views: Vec<WeakEntity<TypstPreviewView>>,
+    views: Vec<WeakEntity<ExternalPreviewView>>,
 }
 
 struct GlobalHub(Entity<Hub>);
@@ -47,10 +126,10 @@ pub(crate) fn init(cx: &mut App) {
 
     let (tx, rx) = smol::channel::unbounded::<HubEvent>();
     if let Err(error) = std::thread::Builder::new()
-        .name("typst-preview-listener".into())
+        .name("external-preview-listener".into())
         .spawn(move || listen(tx))
     {
-        log::error!("typst preview: cannot start listener: {error}");
+        log::error!("external preview: cannot start listener: {error}");
         return;
     }
     cx.spawn(async move |cx| {
@@ -85,7 +164,7 @@ fn remove_stale_sockets(dir: &Path) {
 fn listen(tx: smol::channel::Sender<HubEvent>) {
     let dir = protocol::socket_dir();
     if let Err(error) = std::fs::create_dir_all(&dir) {
-        log::error!("typst preview: cannot create {dir:?}: {error}");
+        log::error!("external preview: cannot create {dir:?}: {error}");
         return;
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
@@ -95,11 +174,11 @@ fn listen(tx: smol::channel::Sender<HubEvent>) {
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(error) => {
-            log::error!("typst preview: cannot listen on {path:?}: {error}");
+            log::error!("external preview: cannot listen on {path:?}: {error}");
             return;
         }
     };
-    log::info!("typst preview: listening on {path:?}");
+    log::info!("external preview: listening on {path:?}");
 
     let mut next_id: ConnId = 1;
     for stream in listener.incoming() {
@@ -110,7 +189,7 @@ fn listen(tx: smol::channel::Sender<HubEvent>) {
         let (writer_tx, writer_rx) = mpsc::channel::<Value>();
         let Ok(write_stream) = stream.try_clone() else { continue };
         std::thread::Builder::new()
-            .name(format!("typst-preview-writer-{id}"))
+            .name(format!("external-preview-writer-{id}"))
             .spawn(move || {
                 let mut w = BufWriter::new(write_stream);
                 for header in writer_rx {
@@ -123,7 +202,7 @@ fn listen(tx: smol::channel::Sender<HubEvent>) {
 
         let tx2 = tx.clone();
         std::thread::Builder::new()
-            .name(format!("typst-preview-reader-{id}"))
+            .name(format!("external-preview-reader-{id}"))
             .spawn(move || {
                 let mut r = BufReader::with_capacity(1 << 20, stream);
                 while let Ok((header, payload)) = read_frame(&mut r) {
@@ -145,18 +224,19 @@ impl Hub {
     fn handle(&mut self, event: HubEvent, cx: &mut Context<Self>) {
         match event {
             HubEvent::Connected(id, writer) => {
-                log::info!("typst preview: language server connected ({id})");
+                log::info!("external preview: language server connected ({id})");
+                // Panes are bound once the server said what it renders.
                 self.conns.insert(
                     id,
                     Conn {
                         roots: Vec::new(),
                         writer,
+                        info: None,
                     },
                 );
-                self.bind_unbound_views(cx);
             }
             HubEvent::Disconnected(id) => {
-                log::info!("typst preview: language server disconnected ({id})");
+                log::info!("external preview: language server disconnected ({id})");
                 self.conns.remove(&id);
                 for view in self.live_views() {
                     view.update(cx, |view, cx| {
@@ -172,12 +252,24 @@ impl Hub {
                 match kind {
                     "hello" => {
                         let version = header.get("version").and_then(Value::as_u64);
-                        if version != Some(protocol::PROTOCOL_VERSION) {
+                        if version.is_none_or(|v| v > protocol::PROTOCOL_VERSION) {
                             log::warn!(
-                                "typst preview: server speaks protocol {version:?}, expected {}",
+                                "external preview: server speaks protocol {version:?}, expected {}",
                                 protocol::PROTOCOL_VERSION
                             );
                         }
+                        let info = ServerInfo::from_hello(&header);
+                        log::info!(
+                            "external preview: server {id} is {} ({}, {:?}, {:?}, protocol {version:?})",
+                            info.name,
+                            info.kind,
+                            info.extensions,
+                            info.layout
+                        );
+                        if let Some(conn) = self.conns.get_mut(&id) {
+                            conn.info = Some(info);
+                        }
+                        self.bind_unbound_views(cx);
                     }
                     "roots" => {
                         if let Some(conn) = self.conns.get_mut(&id) {
@@ -202,8 +294,11 @@ impl Hub {
                             let split = header.get("split").and_then(Value::as_bool).unwrap_or(true);
                             let explicit = header.get("explicit").and_then(Value::as_bool).unwrap_or(false);
                             let has_view = self.live_views().iter().any(|v| v.read(cx).conn() == Some(id));
-                            if explicit || !has_view {
-                                cx.defer(move |cx| TypstPreviewView::open_for_path(path, split, cx));
+                            let info = self.conns.get(&id).and_then(|c| c.info.clone());
+                            if let Some(info) = info
+                                && (explicit || !has_view)
+                            {
+                                cx.defer(move |cx| ExternalPreviewView::open_for_path(path, info, split, cx));
                             }
                         }
                     }
@@ -232,16 +327,20 @@ impl Hub {
         }
     }
 
-    fn live_views(&mut self) -> Vec<Entity<TypstPreviewView>> {
+    fn live_views(&mut self) -> Vec<Entity<ExternalPreviewView>> {
         self.views.retain(|v| v.upgrade().is_some());
         self.views.iter().filter_map(|v| v.upgrade()).collect()
     }
 
-    /// Picks the server responsible for `path`: the one whose workspace root
-    /// contains it (longest match), otherwise the most recent one.
-    fn pick(&self, path: &Path) -> Option<ConnId> {
-        self.conns
-            .iter()
+    /// Picks the server among `candidates` responsible for `path`: the one
+    /// whose workspace root contains it (longest match), otherwise the most
+    /// recent one.
+    fn pick_among<'a>(
+        candidates: impl Iterator<Item = (&'a ConnId, &'a Conn)> + Clone,
+        path: &Path,
+    ) -> Option<ConnId> {
+        candidates
+            .clone()
             .filter_map(|(id, c)| {
                 c.roots
                     .iter()
@@ -252,28 +351,49 @@ impl Hub {
             })
             .max()
             .map(|(_, id)| id)
-            .or_else(|| self.conns.keys().next_back().copied())
+            .or_else(|| candidates.map(|(id, _)| *id).max())
+    }
+
+    /// The server of `kind` responsible for `path`.
+    fn pick(&self, kind: &str, path: &Path) -> Option<ConnId> {
+        let candidates = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.info.as_ref().is_some_and(|i| i.kind == kind));
+        Self::pick_among(candidates, path)
+    }
+
+    /// What would preview `path`: the server that handles its extension (if
+    /// several do, the one whose workspace root contains it).
+    pub(crate) fn info_for_path(&self, path: &Path) -> Option<ServerInfo> {
+        let candidates = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.info.as_ref().is_some_and(|i| i.handles(path)));
+        let id = Self::pick_among(candidates, path)?;
+        self.conns.get(&id)?.info.clone()
     }
 
     fn bind_unbound_views(&mut self, cx: &mut Context<Self>) {
         for view in self.live_views() {
-            let (conn, path) = {
+            let (conn, kind, path) = {
                 let v = view.read(cx);
-                (v.conn(), v.source_path())
+                (v.conn(), v.kind().to_string(), v.source_path())
             };
             if conn.is_none()
-                && let Some(id) = self.pick(&path)
+                && let Some(id) = self.pick(&kind, &path)
                 && let Some(c) = self.conns.get(&id)
+                && let Some(info) = c.info.clone()
             {
                 // Panes get their own sender: they must not call back into the
                 // hub while it is being updated.
                 let writer = c.writer.clone();
-                view.update(cx, |view, cx| view.set_conn(Some((id, writer)), cx));
+                view.update(cx, |view, cx| view.set_conn(Some((id, writer, info)), cx));
             }
         }
     }
 
-    pub(crate) fn add_view(&mut self, view: WeakEntity<TypstPreviewView>, cx: &mut Context<Self>) {
+    pub(crate) fn add_view(&mut self, view: WeakEntity<ExternalPreviewView>, cx: &mut Context<Self>) {
         self.views.push(view);
         self.bind_unbound_views(cx);
     }

@@ -66,7 +66,7 @@ def main():
     server.bind(str(sock_path))
     server.listen(1)
 
-    env = dict(os.environ, ZED_TYPST_PREVIEW_SOCKET=str(sock_path), RUST_LOG="typst_livepreview=info")
+    env = dict(os.environ, ZED_PREVIEW_SOCKET=str(sock_path), RUST_LOG="typst_livepreview=info")
     proc = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     # Drain LSP stdout and answer server→client requests.
     def drain():
@@ -79,6 +79,8 @@ def main():
     conn.settimeout(10)
     hello, _ = read_frame(conn)
     assert hello["type"] == "hello", hello
+    assert hello["version"] == 3 and hello["kind"] == "typst" and hello["extensions"] == ["typ"] \
+        and hello["layout"] == "fixed", hello
     print(f"✓ server connected (protocol v{hello['version']})")
 
     lsp_send(proc, {"id": 1, "method": "initialize", "params": {

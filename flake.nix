@@ -78,7 +78,7 @@
       mkZed = zed-editor: zed-editor.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [ ./zed-patch/zed-integration.patch ];
         postPatch = (old.postPatch or "") + ''
-          for crate in typst_preview extension_toolbar; do
+          for crate in external_preview extension_toolbar; do
             cp -r ${./zed-patch}/$crate crates/$crate
             chmod -R u+w crates/$crate
             ln -sf ../../LICENSE-GPL crates/$crate/LICENSE-GPL

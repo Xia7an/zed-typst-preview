@@ -1,4 +1,8 @@
-"""Plays the typst-livepreview server against a real patched Zed (isolated user data dir).
+"""Plays preview servers against a real patched Zed (isolated user data dir).
+
+The first fake server is a Typst server speaking protocol v2 (no `kind` in its
+hello: compatibility). The second one renders Markdown with `layout: reflow`
+(protocol v3): it gets its own pane, bound to it by kind, and `viewport` sizes.
 
 Usage: python3 -I zed-patch/tests/pane_test.py <path to zed binary> <scratch dir>
 """
@@ -11,6 +15,8 @@ proj = base / "proj"; proj.mkdir(parents=True, exist_ok=True)
 data = base / "zed-data"; data.mkdir(exist_ok=True)
 main = (proj / "main.typ"); main.write_text("= Hello\n\nSome text.\n")
 main = main.resolve()
+notes = (proj / "notes.md"); notes.write_text("# Notes\n\nSome *text*.\n")
+notes = notes.resolve()
 
 def rx(conn, n):
     b = bytearray()
@@ -29,8 +35,20 @@ def write(conn, h, p=b""):
     conn.sendall(struct.pack("<I", len(hb)) + hb + struct.pack("<I", len(p)) + p)
 
 proc = subprocess.Popen([ZED, "--user-data-dir", str(data), str(proj)],
-                        stdout=open(base / "zed.out", "w"), stderr=subprocess.STDOUT, env=dict(os.environ, RUST_BACKTRACE="1", ZED_LOG="typst_preview=trace,info"))
-sock = Path(f"/tmp/zed-typst-preview-{os.getuid()}/{proc.pid}.sock")
+                        stdout=open(base / "zed.out", "w"), stderr=subprocess.STDOUT, env=dict(os.environ, RUST_BACKTRACE="1", ZED_LOG="external_preview=trace,info"))
+sock = Path(f"/tmp/zed-preview-{os.getuid()}/{proc.pid}.sock")
+
+def drain(c, timeout):
+    """Messages from Zed on `c` until it is quiet for `timeout` s."""
+    c.settimeout(timeout)
+    got = []
+    try:
+        while True:
+            got.append(read(c)[0])
+    except socket.timeout:
+        pass
+    c.settimeout(20)
+    return got
 try:
     t0 = time.time()
     while not sock.exists() and time.time() - t0 < 60: time.sleep(0.2)
@@ -124,6 +142,40 @@ try:
                 break
     except socket.timeout:
         print("✗ no cursor report from the pane")
+
+    # A second kind of preview: a Markdown server that reflows to the pane.
+    md = socket.socket(socket.AF_UNIX); md.connect(str(sock)); md.settimeout(20)
+    write(md, {"type": "hello", "version": 3, "pid": os.getpid(), "kind": "markdown",
+               "name": "Markdown", "extensions": ["md"], "layout": "reflow"})
+    write(md, {"type": "roots", "roots": [str(proj.resolve())]})
+    write(md, {"type": "open_preview", "path": str(notes), "split": True, "explicit": True})
+    got = drain(md, 5)
+    attach = [h for h in got if h["type"] == "attach"]
+    viewports = [h for h in got if h["type"] == "viewport"]
+    assert attach and attach[0]["path"] == str(notes), got
+    assert viewports and viewports[-1]["width"] > 0, got
+    width = viewports[-1]["width"]
+    print(f"✓ Markdown server got its own pane: attach {notes.name}, viewport width {width:.1f}")
+    typst_got = drain(conn, 1)
+    assert not any(h["type"] in ("attach", "detach") for h in typst_got), typst_got
+    print("✓ the Typst server was not involved (no attach/detach)")
+
+    # A page as wide as asked: the pane shows it at zoom 1 and asks for strips.
+    write(md, {"type": "document", "generation": 1, "compile_ms": 1.0, "warnings": 0,
+               "pages": [{"width": width, "height": 200.0, "hash": "ad1"}]})
+    got = drain(md, 3)
+    reqs = [r for h in got if h["type"] == "render" for r in h["requests"]]
+    assert reqs and all(r["hash"] == "ad1" for r in reqs), got
+    print(f"✓ pane requested strips of the reflowed page at {reqs[0]['scale_milli'] / 1000:.2f} px/unit")
+
+    # Back to Typst: its preview is revealed, the Markdown one stays open.
+    write(conn, {"type": "open_preview", "path": str(main), "split": True, "explicit": True})
+    typst_got = drain(conn, 3)
+    assert any(h["type"] == "attach" and h["path"] == str(main) for h in typst_got), typst_got
+    md_got = drain(md, 1)
+    assert not any(h["type"] == "detach" for h in md_got), md_got
+    assert proc.poll() is None, f"Zed exited with {proc.returncode}"
+    print("✓ Typst and Markdown previews coexist; Zed still running")
 except Exception as e:
     print("FAIL:", repr(e), "zed exit code:", proc.poll())
 finally:

@@ -42,7 +42,7 @@ Zed (パッチ適用済み)                         typst-livepreview (言語サ
 ┌──────────────────────────────┐  LSP (stdio)  ┌─────────────────────────────────┐
 │ エディタ ── didChange/codeAction ───────────▶│ core: typst の World に編集を適用 │
 │                              │               │       → インクリメンタルコンパイル │
-│ Typst Preview ペイン (GPUI)  │  Unix socket  │ diff/render: 変わった帯だけを描画 │
+│ プレビューペイン (GPUI)      │  Unix socket  │ diff/render: 変わった帯だけを描画 │
 │  表示/スクロール/ズーム ◀── bitmap/cursor ──│                                 │
 │  クリック/カーソル ── click/cursor ────────▶│ jump: typst-ide でソース位置を解決 │
 └──────────────────────────────┘               └─────────────────────────────────┘
@@ -51,12 +51,14 @@ Zed (パッチ適用済み)                         typst-livepreview (言語サ
 | ディレクトリ | 内容 |
 | --- | --- |
 | `server/` | 言語サーバー兼レンダラ `typst-livepreview`(Rust, ネイティブ) |
-| `zed-patch/` | Zed へのパッチ: Typst プレビューペイン(`typst_preview`)と、拡張機能が宣言するツールバーボタン(`extension_toolbar`) |
+| `zed-patch/` | Zed へのパッチ: 外部の描画サーバー用のプレビューペイン(`external_preview`)と、拡張機能が宣言するツールバーボタン(`extension_toolbar`) |
 | `src/`, `extension.toml` | Zed 拡張機能(言語サーバーを起動するだけの WASM) |
 | `flake.nix` | ビルドに必要なツール一式・サーバー・パッチ適用済み Zed |
 | `docs/PROTOCOL.md` | Zed のペインとサーバー間のプロトコル |
 
 Zed の拡張機能 API では独自の描画ペインを作れないため、Zed 本体に小さなパッチを当てています。パッチなしの Zed でも動きますが、その場合プレビューは別ウィンドウ(winit + softbuffer)になります。
+
+パッチのペインとボタンは Typst 専用ではありません。描画サーバーは `hello` で「何を描くか(`kind`)・どの拡張子か・レイアウト(固定 / ペイン幅で組み直す)」を名乗り、ページのビットマップを送ります。Markdown など別の形式のプレビューも、Zed を変更せずに拡張機能(サーバーとボタンの宣言)と描画サーバーだけで作れます。書き方は `docs/PROTOCOL.md` の「Writing a preview server」を参照してください。
 
 ## インストール (Nix)
 
@@ -112,7 +114,7 @@ inputs.zed-typst-livepreview.url = "git+ssh://git@github.com/Xia7an/zed-typst-pr
 { inputs, pkgs, ... }:
 let tlp = inputs.zed-typst-livepreview.packages.${pkgs.stdenv.hostPlatform.system}; in
 {
-  programs.zed-editor.package = tlp.zed-editor;   # Zed + Typst プレビューペイン
+  programs.zed-editor.package = tlp.zed-editor;   # Zed + プレビューペイン
   home.packages = [ tlp.typst-livepreview ];      # 言語サーバー (PATH に置く)
 }
 ```
@@ -141,7 +143,7 @@ nix develop -c zeditor .
 
 | 操作 | 方法 |
 | --- | --- |
-| プレビューを開く | `.typ` を開いてツールバーの 👁 ボタン(分割で開く / Alt+クリックで同じペイン)、コマンドパレットの `typst preview: open preview to the side`、またはコードアクション(`Cmd+.`)の **Open Typst Live Preview** |
+| プレビューを開く | `.typ` を開いてツールバーの 👁 ボタン(分割で開く / Alt+クリックで同じペイン)、コマンドパレットの `external preview: open preview to the side`、またはコードアクション(`Cmd+.`)の **Open Typst Live Preview** |
 | PDF を書き出す | ツールバーの PDF ボタン(👁 の左)。メインファイルの隣に `<メインファイル名>.pdf` を書き出します(保存前の編集も反映)。パッチなしの Zed ではコードアクションの **Export PDF** |
 | ソースへジャンプ | プレビューをクリック |
 | スクロール | ホイール / トラックパッド / ドラッグ / 矢印・PageUp/Down・Space |
@@ -194,13 +196,13 @@ CLICK=600,130 python3 -I tests/lsp_smoke.py target/release/typst-livepreview  # 
 
 デバッグ用の環境変数: `RUST_LOG=typst_livepreview=debug`(「edit → on screen」の遅延を記録)、`TYPST_LIVEPREVIEW_NO_EMBED=1`(常に別ウィンドウ)。
 
-Zed のパッチを更新するときは、Zed v1.26.2 のソースの `crates/` に `zed-patch/typst_preview` と `zed-patch/extension_toolbar` をコピーし、`zed-integration.patch` と `cargo-lock.patch` を当ててから、nix のビルド環境で差分ビルドすると速いです(初回 20〜30 分、以降は 1 分程度):
+Zed のパッチを更新するときは、Zed v1.26.2 のソースの `crates/` に `zed-patch/external_preview` と `zed-patch/extension_toolbar` をコピーし、`zed-integration.patch` と `cargo-lock.patch` を当ててから、nix のビルド環境で差分ビルドすると速いです(初回 20〜30 分、以降は 1 分程度):
 
 ```sh
 nix develop /path/to/zed-typst-livepreview#zed-editor -c bash -c \
   'unset LK_CUSTOM_WEBRTC; CARGO_PROFILE_DEV_DEBUG=0 cargo build -p zed --features gpui_platform/runtime_shaders'
-python3 -I zed-patch/tests/pane_test.py target/debug/zed /tmp/tlp-pane      # 偽サーバーでペインを試験
+python3 -I zed-patch/tests/pane_test.py target/debug/zed /tmp/tlp-pane      # 偽サーバー(Typst v2 互換 + Markdown 風 reflow)でペインを試験
 python3 -I zed-patch/tests/e2e_test.py target/debug/zed <server> <extension.wasm> /tmp/tlp-e2e  # 実サーバーで通し試験
 ```
 
-ペインのログは `ZED_LOG=typst_preview=debug` で `~/Library/Logs/Zed/Zed.log` に出ます。
+ペインのログは `ZED_LOG=external_preview=debug` で `~/Library/Logs/Zed/Zed.log` に出ます。
