@@ -1,13 +1,39 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 03f1870..4f8f025 100644
+index 03f1870..f4aaaf7 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -19308,6 +19308,24 @@ version = "1.19.0"
- source = "registry+https://github.com/rust-lang/crates.io-index"
- checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+@@ -6206,6 +6206,25 @@ dependencies = [
+  "path",
+ ]
  
 +[[package]]
-+name = "typst_preview"
++name = "extension_toolbar"
++version = "0.1.0"
++dependencies = [
++ "editor",
++ "extension_host",
++ "gpui",
++ "icons",
++ "log",
++ "lsp",
++ "project",
++ "serde",
++ "serde_json",
++ "settings",
++ "toml 0.9.8",
++ "ui",
++ "workspace",
++]
++
+ [[package]]
+ name = "extensions_ui"
+ version = "0.1.0"
+@@ -6247,6 +6266,24 @@ dependencies = [
+  "zed_actions",
+ ]
+ 
++[[package]]
++name = "external_preview"
 +version = "0.1.0"
 +dependencies = [
 + "editor",
@@ -25,13 +51,15 @@ index 03f1870..4f8f025 100644
 +]
 +
  [[package]]
- name = "ucd-trie"
- version = "0.1.7"
-@@ -22709,6 +22727,7 @@ dependencies = [
-  "title_bar",
-  "toolchain_selector",
-  "tracing",
-+ "typst_preview",
-  "ui",
-  "ui_prompt",
-  "url",
+ name = "failspot"
+ version = "0.2.0"
+@@ -22608,7 +22645,9 @@ dependencies = [
+  "etw_tracing",
+  "extension",
+  "extension_host",
++ "extension_toolbar",
+  "extensions_ui",
++ "external_preview",
+  "feature_flags",
+  "feedback",
+  "file_finder",

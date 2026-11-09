@@ -1,5 +1,5 @@
-//! Wire format shared with the `typst-livepreview` server (see its
-//! `docs/PROTOCOL.md`): `u32 LE header length | JSON header | u32 LE payload
+//! Wire format shared with the preview servers (see `docs/PROTOCOL.md` of
+//! zed-typst-livepreview): `u32 LE header length | JSON header | u32 LE payload
 //! length | payload`.
 
 use std::io::{self, Read, Write};
@@ -7,13 +7,13 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u64 = 2;
+pub const PROTOCOL_VERSION: u64 = 3;
 
-/// `/tmp/zed-typst-preview-<uid>/<zed pid>.sock`. Language servers are child
+/// `/tmp/zed-preview-<uid>/<zed pid>.sock`. Language servers are child
 /// processes of Zed, so they find it through their parent pid.
 pub fn socket_dir() -> PathBuf {
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/zed-typst-preview-{uid}"))
+    PathBuf::from(format!("/tmp/zed-preview-{uid}"))
 }
 
 pub fn socket_path() -> PathBuf {

@@ -118,6 +118,7 @@ def main():
         "context": {"diagnostics": []}}})
     actions = wait_for(lambda m: m.get("id") == 5)["result"]
     assert actions and actions[0]["command"]["command"] == "typst-livepreview.open", actions
+    assert [a["command"]["command"] for a in actions] == ["typst-livepreview.open", "typst-livepreview.exportPdf"], actions
     send({"id": 6, "method": "workspace/executeCommand", "params": actions[0]["command"]})
     wait_for(lambda m: m.get("id") == 6)
     print("✓ 'Open Typst Live Preview' code action")
@@ -162,8 +163,48 @@ def main():
         "range": {"start": {"line": line, "character": 2}, "end": {"line": line, "character": 2}},
         "context": {"diagnostics": []}}})
     resp = wait_for(lambda m: m.get("id") == 2)
-    assert resp["result"] == [], f"no actions expected while open: {resp}"
+    # Outside Zed's pane, "Export PDF" stays available (no toolbar button).
+    titles = [a["title"] for a in resp["result"]]
+    assert titles == ["Export PDF"], f"only 'Export PDF' expected while open: {resp}"
     print("✓ cursor sync request handled")
+
+    # Export PDF, with the arguments a toolbar button sends. The PDF reflects
+    # the unsaved buffer, so it must contain the typed text.
+    pdf = tmp / "main.pdf"
+    mods = {"modifiers": {"alt": False, "shift": False, "control": False, "platform": False}}
+    send({"id": 7, "method": "workspace/executeCommand",
+          "params": {"command": "typst-livepreview.exportPdf", "arguments": [uri, mods]}})
+    resp = wait_for(lambda m: m.get("id") == 7, timeout=30)
+    assert "error" not in resp, resp
+    assert Path(resp["result"]) == pdf, resp
+    assert pdf.read_bytes().startswith(b"%PDF"), "not a PDF"
+    info = wait_for(lambda m: m.get("method") == "window/showMessage")
+    assert info["params"]["type"] == 3 and "main.pdf" in info["params"]["message"], info
+    print(f"✓ exportPdf wrote {pdf.name} ({pdf.stat().st_size} bytes) and notified")
+
+    # A compile error: error response + error message, no PDF written.
+    pdf.unlink()
+    send({"method": "textDocument/didChange", "params": {
+        "textDocument": {"uri": uri, "version": 100},
+        "contentChanges": [{"range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 0, "character": 0}},
+                            "text": "#undefined-function()\n"}]}})
+    send({"id": 8, "method": "workspace/executeCommand",
+          "params": {"command": "typst-livepreview.exportPdf", "arguments": [uri]}})
+    resp = wait_for(lambda m: m.get("id") == 8, timeout=30)
+    assert "error" in resp and "main.typ:1:" in resp["error"]["message"], resp
+    err = wait_for(lambda m: m.get("method") == "window/showMessage")
+    assert err["params"]["type"] == 1, err
+    assert not pdf.exists(), "PDF written despite the error"
+    print(f"✓ exportPdf reports compile errors: {resp['error']['message']}")
+
+    # The toolbar button's "open" (alt-click = this pane) is accepted.
+    send({"id": 9, "method": "workspace/executeCommand", "params": {
+        "command": "typst-livepreview.open",
+        "arguments": [uri, {"modifiers": {"alt": True}}]}})
+    resp = wait_for(lambda m: m.get("id") == 9)
+    assert "error" not in resp, resp
+    print("✓ open with modifiers accepted")
 
     if env["TYPST_LIVEPREVIEW_TEST_CLICK"]:
         msg = wait_for(lambda m: m.get("method") == "window/showDocument")

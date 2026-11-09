@@ -46,7 +46,7 @@ languages = ["Typst"]
 LOG = Path.home() / "Library/Logs/Zed/Zed.log"
 log_start = LOG.stat().st_size if LOG.exists() else 0
 out = open(base / "zed.out", "w")
-env = dict(os.environ, ZED_LOG="typst_preview=debug,info", RUST_LOG="typst_livepreview=debug")
+env = dict(os.environ, ZED_LOG="external_preview=debug,info", RUST_LOG="typst_livepreview=debug")
 proc = subprocess.Popen([ZED, "--user-data-dir", str(data), str(proj), str(main)], stdout=out, stderr=subprocess.STDOUT, env=env)
 
 def wait_log(pattern, timeout, start=0):

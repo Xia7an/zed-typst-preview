@@ -17,7 +17,7 @@ use ui::prelude::*;
 use workspace::item::{Item, ItemEvent};
 use workspace::{MultiWorkspace, OpenOptions, OpenVisible, Pane, Workspace};
 
-use crate::hub::{self, ConnId, Writer};
+use crate::hub::{self, ConnId, Layout, ServerInfo, Writer};
 use crate::protocol::parse_hash;
 use crate::{FitWidth, OpenPreview, OpenPreviewToTheSide, ZoomIn, ZoomOut};
 
@@ -103,11 +103,18 @@ pub enum PreviewEvent {
     TitleChanged,
 }
 
-pub struct TypstPreviewView {
+pub struct ExternalPreviewView {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     window: gpui::AnyWindowHandle,
     origin_pane: Option<WeakEntity<Pane>>,
+    /// The kind of document shown (`hello.kind` of the servers it binds to).
+    kind: String,
+    /// The files this preview follows (the server's extensions).
+    extensions: Vec<String>,
+    layout: Layout,
+    /// The page width last asked for (`Layout::Reflow` only).
+    last_viewport: Option<f32>,
     /// The file the preview was opened for (sent to the server on attach).
     source: PathBuf,
     title: SharedString,
@@ -147,11 +154,6 @@ pub struct TypstPreviewView {
     _workspace_subscription: Subscription,
 }
 
-fn is_typst(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("typ"))
-}
-
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -162,51 +164,57 @@ fn editor_path(editor: &Entity<Editor>, cx: &App) -> Option<PathBuf> {
     Some(file.as_local()?.abs_path(cx))
 }
 
-impl TypstPreviewView {
+impl ExternalPreviewView {
     pub fn register(workspace: &mut Workspace, _window: &mut Window, _cx: &mut Context<Workspace>) {
         workspace.register_action(|workspace, _: &OpenPreview, window, cx| {
-            if let Some((path, pane)) = Self::active_typst_file(workspace, cx) {
-                Self::open(workspace, path, pane, false, window, cx);
+            if let Some((path, info, pane)) = Self::active_previewable_file(workspace, cx) {
+                Self::open(workspace, path, info, pane, false, window, cx);
             }
         });
         workspace.register_action(|workspace, _: &OpenPreviewToTheSide, window, cx| {
-            if let Some((path, pane)) = Self::active_typst_file(workspace, cx) {
-                Self::open(workspace, path, pane, true, window, cx);
+            if let Some((path, info, pane)) = Self::active_previewable_file(workspace, cx) {
+                Self::open(workspace, path, info, pane, true, window, cx);
             }
         });
     }
 
-    fn active_typst_file(
+    /// The active file, if a connected server previews its file type.
+    fn active_previewable_file(
         workspace: &Workspace,
         cx: &mut Context<Workspace>,
-    ) -> Option<(PathBuf, Entity<Pane>)> {
+    ) -> Option<(PathBuf, ServerInfo, Entity<Pane>)> {
         let editor = workspace.active_item(cx)?.act_as::<Editor>(cx)?;
         let path = editor_path(&editor, cx)?;
-        is_typst(&path).then(|| (path, workspace.active_pane().clone()))
+        let info = hub::hub(cx)?.read(cx).info_for_path(&path)?;
+        Some((path, info, workspace.active_pane().clone()))
     }
 
-    /// The file shown by `editor`, if it is a local file.
-    pub fn editor_path(editor: &Entity<Editor>, cx: &App) -> Option<PathBuf> {
-        editor_path(editor, cx)
+    /// Whether `editor` shows a file of this preview's kind.
+    fn follows_editor(&self, editor: &Entity<Editor>, cx: &App) -> bool {
+        editor_path(editor, cx).is_some_and(|p| hub::handles(&self.extensions, &p))
     }
 
-    pub fn is_typst_editor(editor: &Entity<Editor>, cx: &App) -> bool {
-        editor_path(editor, cx).is_some_and(|p| is_typst(&p))
+    pub(crate) fn kind(&self) -> &str {
+        &self.kind
     }
 
-    /// Opens (or reveals) the preview of `path`, next to `origin` if
-    /// `to_the_side`.
-    pub fn open(
+    /// Opens (or reveals) the preview of `path`, rendered by servers like
+    /// `info`, next to `origin` if `to_the_side`.
+    pub(crate) fn open(
         workspace: &mut Workspace,
         path: PathBuf,
+        info: ServerInfo,
         origin: Entity<Pane>,
         to_the_side: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        // One preview per workspace: re-target an existing one.
+        // One preview per kind and workspace: re-target an existing one.
         for pane in workspace.panes().to_vec() {
-            let existing = pane.read(cx).items_of_type::<Self>().next();
+            let existing = pane
+                .read(cx)
+                .items_of_type::<Self>()
+                .find(|view| view.read(cx).kind == info.kind);
             if let Some(view) = existing {
                 view.update(cx, |view, cx| view.retarget(path.clone(), cx));
                 if let Some(ix) = pane.read(cx).index_for_item(&view) {
@@ -220,7 +228,7 @@ impl TypstPreviewView {
         } else {
             origin.clone()
         };
-        let view = Self::new(path, workspace, Some(origin.downgrade()), window, cx);
+        let view = Self::new(path, info, workspace, Some(origin.downgrade()), window, cx);
         target.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, !to_the_side, None, window, cx)
         });
@@ -230,9 +238,10 @@ impl TypstPreviewView {
         }
     }
 
-    /// Opens a preview requested by the language server (a code action or
-    /// `auto_open`), in the window whose project contains `path`.
-    pub(crate) fn open_for_path(path: PathBuf, cx: &mut App) {
+    /// Opens a preview requested by a server (a toolbar button, a code action
+    /// or `auto_open`), in the window whose project contains `path`: next to
+    /// the active pane if `split`, else in it.
+    pub(crate) fn open_for_path(path: PathBuf, info: ServerInfo, split: bool, cx: &mut App) {
         let target = canonical(&path);
         for window in cx.windows() {
             let Some(multi) = window.downcast::<MultiWorkspace>() else {
@@ -251,7 +260,7 @@ impl TypstPreviewView {
                         if contains {
                             workspace.update(cx, |workspace, cx| {
                                 let origin = workspace.active_pane().clone();
-                                Self::open(workspace, path.clone(), origin, true, window, cx);
+                                Self::open(workspace, path.clone(), info.clone(), origin, split, window, cx);
                             });
                             return true;
                         }
@@ -267,6 +276,7 @@ impl TypstPreviewView {
 
     fn new(
         source: PathBuf,
+        info: ServerInfo,
         workspace: &Workspace,
         origin_pane: Option<WeakEntity<Pane>>,
         window: &mut Window,
@@ -305,6 +315,10 @@ impl TypstPreviewView {
                 workspace: workspace_handle,
                 window: window.window_handle(),
                 origin_pane,
+                kind: info.kind,
+                extensions: info.extensions,
+                layout: info.layout,
+                last_viewport: None,
                 source,
                 title,
                 conn: None,
@@ -365,12 +379,18 @@ impl TypstPreviewView {
         }
     }
 
-    pub(crate) fn set_conn(&mut self, conn: Option<(ConnId, Writer)>, cx: &mut Context<Self>) {
-        self.conn = conn;
+    pub(crate) fn set_conn(&mut self, conn: Option<(ConnId, Writer, ServerInfo)>, cx: &mut Context<Self>) {
+        self.conn = conn.map(|(id, writer, info)| {
+            self.extensions = info.extensions;
+            self.layout = info.layout;
+            (id, writer)
+        });
         self.in_flight.clear();
         self.last_wanted.clear();
+        self.last_viewport = None;
         if self.conn.is_some() {
             self.send(json!({ "type": "attach", "path": self.source }));
+            self.send_viewport();
             if let Some(editor) = self.tracked_editor.as_ref().and_then(|e| e.upgrade()) {
                 self.send_cursor(&editor, cx);
             }
@@ -404,9 +424,9 @@ impl TypstPreviewView {
         self.track_editor(editor, window, cx);
     }
 
-    /// Follows the cursor of `editor` if it shows a Typst file.
+    /// Follows the cursor of `editor` if it shows a file of this kind.
     fn track_editor(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
-        if !Self::is_typst_editor(&editor, cx) {
+        if !self.follows_editor(&editor, cx) {
             return;
         }
         if self.tracked_editor.as_ref().and_then(|e| e.upgrade()).as_ref() == Some(&editor) {
@@ -488,7 +508,7 @@ impl TypstPreviewView {
                     }
                     pages.push(page);
                 }
-                log::debug!("typst preview: document with {} pages", pages.len());
+                log::debug!("external preview: document with {} pages", pages.len());
                 self.pages = pages;
                 self.error = None;
                 self.shown.resize(self.pages.len(), Vec::new());
@@ -663,10 +683,34 @@ impl TypstPreviewView {
     }
 
     fn update_zoom(&mut self) {
-        if self.fit_width && self.bounds.is_some() && !self.pages.is_empty() {
-            self.zoom = self.fit_zoom();
+        match self.layout {
+            Layout::Fixed => {
+                if self.fit_width && self.bounds.is_some() && !self.pages.is_empty() {
+                    self.zoom = self.fit_zoom();
+                }
+            }
+            // The server fits the pages to the width we ask for.
+            Layout::Reflow => self.send_viewport(),
         }
         self.clamp_scroll();
+    }
+
+    /// Tells a reflowing server how wide the pages should be (in its units):
+    /// the pane width at the current zoom.
+    fn send_viewport(&mut self) {
+        if self.layout != Layout::Reflow || self.conn.is_none() {
+            return;
+        }
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        let width = ((bounds.size.width.as_f32() - 2.0 * MARGIN) / self.zoom).max(1.0);
+        if self.last_viewport.is_some_and(|last| (last - width).abs() < 0.5) {
+            return;
+        }
+        self.last_viewport = Some(width);
+        log::debug!("external preview: viewport width {width:.1}");
+        self.send(json!({ "type": "viewport", "width": width }));
     }
 
     fn layout(&self) -> (Vec<Rect>, (f32, f32)) {
@@ -827,7 +871,7 @@ impl TypstPreviewView {
                 .iter()
                 .map(|k| json!({ "hash": format!("{:x}", k.0), "scale_milli": k.1 }))
                 .collect();
-            log::debug!("typst preview: requesting {} strip runs", requests.len());
+            log::debug!("external preview: requesting {} strip runs", requests.len());
             self.send(json!({ "type": "render", "wanted": wanted_json, "requests": requests }));
             self.last_wanted = wanted;
         }
@@ -1036,7 +1080,7 @@ fn jump(
     .detach();
 }
 
-impl Render for TypstPreviewView {
+impl Render for ExternalPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.collect_garbage(window);
         self.scale_factor = window.scale_factor();
@@ -1049,7 +1093,7 @@ impl Render for TypstPreviewView {
             .filter(|&i| rects[i].y + rects[i].h > sy && rects[i].y < sy + vh)
             .collect();
         log::trace!(
-            "typst preview: render, bounds {:?}, {} pages, visible {visible:?}",
+            "external preview: render, bounds {:?}, {} pages, visible {visible:?}",
             self.bounds,
             self.pages.len()
         );
@@ -1147,9 +1191,9 @@ impl Render for TypstPreviewView {
 
         let placeholder = if self.pages.is_empty() {
             Some(if self.conn.is_none() {
-                "Waiting for the typst-livepreview language server…"
+                "Waiting for the preview server…"
             } else {
-                "Compiling…"
+                "Rendering…"
             })
         } else {
             None
@@ -1157,8 +1201,8 @@ impl Render for TypstPreviewView {
 
         let this = cx.entity().downgrade();
         div()
-            .id("TypstPreview")
-            .key_context("TypstPreview")
+            .id("ExternalPreview")
+            .key_context("ExternalPreview")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .relative()
@@ -1166,9 +1210,13 @@ impl Render for TypstPreviewView {
             .bg(colors.editor_background)
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.set_zoom(this.zoom * 1.2, None, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(this.zoom / 1.2, None, cx)))
-            .on_action(cx.listener(|this, _: &FitWidth, _, cx| {
-                this.fit_width = true;
-                cx.notify();
+            .on_action(cx.listener(|this, _: &FitWidth, _, cx| match this.layout {
+                Layout::Fixed => {
+                    this.fit_width = true;
+                    cx.notify();
+                }
+                // Pages always fill the width: back to the default text size.
+                Layout::Reflow => this.set_zoom(1.0, None, cx),
             }))
             .on_scroll(cx.listener(Self::on_scroll))
             .on_pinch(cx.listener(Self::on_pinch))
@@ -1224,15 +1272,15 @@ impl Render for TypstPreviewView {
     }
 }
 
-impl Focusable for TypstPreviewView {
+impl Focusable for ExternalPreviewView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl EventEmitter<PreviewEvent> for TypstPreviewView {}
+impl EventEmitter<PreviewEvent> for ExternalPreviewView {}
 
-impl Item for TypstPreviewView {
+impl Item for ExternalPreviewView {
     type Event = PreviewEvent;
 
     fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {

@@ -16,7 +16,7 @@ use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
 use lsp_types::{
     CodeActionKind, CodeActionOrCommand, CodeActionProviderCapability, Command, ExecuteCommandOptions,
-    InitializeParams, Position, Range, ServerCapabilities, ServerInfo, ShowDocumentParams,
+    InitializeParams, MessageType, Position, Range, ServerCapabilities, ServerInfo, ShowDocumentParams, ShowMessageParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use parking_lot::Mutex;
@@ -27,6 +27,7 @@ use crate::core::{self, CoreMsg, Editor, Shared, TextChange};
 use crate::viewer::{UiEvent, UiSender};
 
 pub const CMD_OPEN: &str = "typst-livepreview.open";
+pub const CMD_EXPORT_PDF: &str = "typst-livepreview.exportPdf";
 
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let path = url::Url::parse(uri.as_str()).ok()?.to_file_path().ok()?;
@@ -93,7 +94,7 @@ pub fn run(proxy: UiSender, embedded: bool) -> anyhow::Result<()> {
         // this is how the preview follows the cursor.
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![CMD_OPEN.into()],
+            commands: vec![CMD_OPEN.into(), CMD_EXPORT_PDF.into()],
             ..Default::default()
         }),
         ..Default::default()
@@ -141,8 +142,9 @@ pub fn run(proxy: UiSender, embedded: bool) -> anyhow::Result<()> {
                 if connection.handle_shutdown(&req)? {
                     break;
                 }
-                let resp = handle_request(req, &core_tx, &shared);
-                connection.sender.send(Message::Response(resp))?;
+                if let Some(resp) = handle_request(req, &core_tx, &shared, &connection.sender, embedded) {
+                    connection.sender.send(Message::Response(resp))?;
+                }
             }
             Message::Notification(not) => {
                 if not.method == lsp_types::notification::Exit::METHOD {
@@ -192,14 +194,45 @@ fn register_file_watcher(connection: &Connection) {
     let _ = connection.sender.send(Message::Request(req));
 }
 
-fn handle_request(req: Request, core: &Sender<CoreMsg>, shared: &Shared) -> Response {
-    match req.method.as_str() {
+/// The arguments of our commands: `[uri, {"modifiers": {"alt": bool, …}}]`.
+/// The second one is added by toolbar buttons (patched Zed).
+struct CommandArgs {
+    path: Option<PathBuf>,
+    alt: bool,
+}
+
+fn command_args(args: &[Value]) -> CommandArgs {
+    let path = args.first().and_then(Value::as_str).and_then(|s| Uri::from_str(s).ok()).and_then(|u| uri_to_path(&u));
+    let alt = args
+        .get(1)
+        .and_then(|ctx| ctx.pointer("/modifiers/alt"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    CommandArgs { path, alt }
+}
+
+fn show_message(sender: &Sender<Message>, typ: MessageType, message: String) {
+    let params = ShowMessageParams { typ, message };
+    let not = Notification::new(lsp_types::notification::ShowMessage::METHOD.into(), params);
+    let _ = sender.send(Message::Notification(not));
+}
+
+/// Handles a request. Returns `None` when the response is sent later (by
+/// another thread, through `sender`).
+fn handle_request(
+    req: Request,
+    core: &Sender<CoreMsg>,
+    shared: &Shared,
+    sender: &Sender<Message>,
+    embedded: bool,
+) -> Option<Response> {
+    Some(match req.method.as_str() {
         lsp_types::request::CodeActionRequest::METHOD => {
             let Ok(params) = serde_json::from_value::<lsp_types::CodeActionParams>(req.params) else {
-                return Response::new_ok(req.id, Value::Null);
+                return Some(Response::new_ok(req.id, Value::Null));
             };
             let Some(path) = uri_to_path(&params.text_document.uri) else {
-                return Response::new_ok(req.id, Value::Null);
+                return Some(Response::new_ok(req.id, Value::Null));
             };
             let start = params.range.start;
             let _ = core.send(CoreMsg::Cursor { path, line: start.line, character: start.character });
@@ -224,28 +257,65 @@ fn handle_request(req: Request, core: &Sender<CoreMsg>, shared: &Shared) -> Resp
                     ..Default::default()
                 }));
             }
+            // Inside the patched Zed, the toolbar has a button for this; an
+            // action that is always available would keep the code action
+            // indicator on all the time.
+            if !embedded && !only_other_kinds {
+                actions.push(CodeActionOrCommand::CodeAction(lsp_types::CodeAction {
+                    title: "Export PDF".into(),
+                    kind: Some(CodeActionKind::EMPTY),
+                    command: Some(Command {
+                        title: "Export PDF".into(),
+                        command: CMD_EXPORT_PDF.into(),
+                        arguments: Some(vec![json!(params.text_document.uri.as_str())]),
+                    }),
+                    ..Default::default()
+                }));
+            }
             Response::new_ok(req.id, actions)
         }
         lsp_types::request::ExecuteCommand::METHOD => {
             let params: lsp_types::ExecuteCommandParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
-                Err(e) => return Response::new_err(req.id, -32602, e.to_string()),
+                Err(e) => return Some(Response::new_err(req.id, -32602, e.to_string())),
             };
-            if params.command == CMD_OPEN {
-                let path = params
-                    .arguments
-                    .first()
-                    .and_then(Value::as_str)
-                    .and_then(|s| Uri::from_str(s).ok())
-                    .and_then(|u| uri_to_path(&u));
-                let _ = core.send(CoreMsg::OpenPreview { path });
-                Response::new_ok(req.id, Value::Null)
-            } else {
-                Response::new_err(req.id, -32601, format!("unknown command {}", params.command))
+            let args = command_args(&params.arguments);
+            match params.command.as_str() {
+                CMD_OPEN => {
+                    // Alt-click on the toolbar button: open in the editor's pane.
+                    let _ = core.send(CoreMsg::OpenPreview { path: args.path, split: !args.alt, explicit: true });
+                    Response::new_ok(req.id, Value::Null)
+                }
+                CMD_EXPORT_PDF => {
+                    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+                    let _ = core.send(CoreMsg::ExportPdf { path: args.path, reply: reply_tx });
+                    // Exporting can take a while: wait off the LSP thread.
+                    let sender = sender.clone();
+                    let id = req.id;
+                    std::thread::spawn(move || {
+                        let result = reply_rx.recv().unwrap_or_else(|_| Err("the server is shutting down".into()));
+                        let resp = match result {
+                            Ok(pdf) => {
+                                show_message(&sender, MessageType::INFO, format!("Exported {}", pdf.display()));
+                                Response::new_ok(id, json!(pdf))
+                            }
+                            Err(e) => {
+                                // Patched Zed's toolbar reports failed commands.
+                                if !embedded {
+                                    show_message(&sender, MessageType::ERROR, e.clone());
+                                }
+                                Response::new_err(id, -32603, e)
+                            }
+                        };
+                        let _ = sender.send(Message::Response(resp));
+                    });
+                    return None;
+                }
+                other => Response::new_err(req.id, -32601, format!("unknown command {other}")),
             }
         }
         _ => Response::new_err(req.id, -32601, format!("method not supported: {}", req.method)),
-    }
+    })
 }
 
 /// Handles a notification. Returns a new configuration if it changed.

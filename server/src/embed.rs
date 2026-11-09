@@ -1,9 +1,10 @@
-//! Bridge to the Typst preview pane built into (patched) Zed.
+//! Bridge to the preview pane built into (patched) Zed.
 //!
-//! When Zed runs with the `typst_preview` patch, it listens on a Unix socket
-//! at `/tmp/zed-typst-preview-<uid>/<zed pid>.sock`. The language server (a
-//! child of Zed) connects to it at startup and then streams page bitmaps to
-//! the pane instead of opening its own window. See `docs/PROTOCOL.md`.
+//! When Zed runs with the `external_preview` patch, it listens on a Unix
+//! socket at `/tmp/zed-preview-<uid>/<zed pid>.sock` (older patches:
+//! `/tmp/zed-typst-preview-…`). The language server (a child of Zed) connects
+//! to it at startup and then streams page bitmaps to the pane instead of
+//! opening its own window. See `docs/PROTOCOL.md`.
 //!
 //! Frame format (both directions):
 //! `u32 LE header length | JSON header | u32 LE payload length | payload`.
@@ -23,26 +24,31 @@ use crate::diff;
 use crate::render::{self, Bitmap, RenderKey, RenderPool, Strips};
 use crate::viewer::{Marker, UiEvent, UiSender};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
-pub fn socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("ZED_TYPST_PREVIEW_SOCKET") {
-        return p.into();
+/// Where Zed's preview pane host may listen, in order: an explicit override,
+/// then the v3 socket, then the one of older patches (protocol v2).
+pub fn socket_paths() -> Vec<PathBuf> {
+    for var in ["ZED_PREVIEW_SOCKET", "ZED_TYPST_PREVIEW_SOCKET"] {
+        if let Some(p) = std::env::var_os(var) {
+            return vec![p.into()];
+        }
     }
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/zed-typst-preview-{uid}")).join(format!("{}.sock", std::os::unix::process::parent_id()))
+    let sock = format!("{}.sock", std::os::unix::process::parent_id());
+    ["zed-preview", "zed-typst-preview"]
+        .iter()
+        .map(|dir| PathBuf::from(format!("/tmp/{dir}-{uid}")).join(&sock))
+        .collect()
 }
 
 /// Connects to Zed's preview pane host, if the editor provides one.
 pub fn connect() -> Option<UnixStream> {
-    let path = socket_path();
-    match UnixStream::connect(&path) {
-        Ok(s) => {
-            log::info!("connected to Zed's preview pane host at {}", path.display());
-            Some(s)
-        }
-        Err(_) => None,
-    }
+    socket_paths().into_iter().find_map(|path| {
+        let stream = UnixStream::connect(&path).ok()?;
+        log::info!("connected to Zed's preview pane host at {}", path.display());
+        Some(stream)
+    })
 }
 
 enum Payload {
@@ -153,7 +159,19 @@ pub fn run(stream: UnixStream) {
     let send = |header: Value, payload: Payload| {
         let _ = out_tx.send((header, payload));
     };
-    send(json!({ "type": "hello", "version": PROTOCOL_VERSION, "pid": std::process::id() }), Payload::None);
+    // What this server renders (protocol v3; older panes ignore the fields).
+    send(
+        json!({
+            "type": "hello",
+            "version": PROTOCOL_VERSION,
+            "pid": std::process::id(),
+            "kind": "typst",
+            "name": "Typst",
+            "extensions": ["typ"],
+            "layout": "fixed",
+        }),
+        Payload::None,
+    );
 
     // The language server itself.
     {
@@ -193,9 +211,12 @@ pub fn run(stream: UnixStream) {
     for msg in rx {
         match msg {
             In::Ui(event) => match event {
-                UiEvent::Show { path, .. } => {
+                UiEvent::Show { path, split, explicit, .. } => {
                     if let Some(path) = path {
-                        send(json!({ "type": "open_preview", "path": path }), Payload::None);
+                        send(
+                            json!({ "type": "open_preview", "path": path, "split": split, "explicit": explicit }),
+                            Payload::None,
+                        );
                     }
                 }
                 UiEvent::Title { title, path } => {
@@ -397,6 +418,8 @@ pub fn run(stream: UnixStream) {
                             }
                         }
                     }
+                    // Typst pages have a fixed size (`layout: fixed`).
+                    "viewport" => {}
                     other => log::debug!("unknown message from Zed: {other}"),
                 }
             }
