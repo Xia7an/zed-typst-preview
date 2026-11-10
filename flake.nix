@@ -41,21 +41,41 @@
           };
         };
 
-      # The Zed extension (src/, extension.toml): only extension.toml and the
-      # wasm component, like Zed's own `zed: install dev extension` produces.
-      mkExtension = pkgs: rust:
+      # The LaTeX preview server (tex/server). Needs latexmk and a TeX
+      # distribution at run time (the user's own, found on the PATH).
+      mkTexServer = pkgs: rustPlatform:
+        let lib = pkgs.lib; in
+        rustPlatform.buildRustPackage {
+          pname = "tex-livepreview";
+          version = "0.1.0";
+          src = ./tex/server;
+          cargoLock.lockFile = ./tex/server/Cargo.lock;
+          buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+          # The tests run latexmk; run them with `cargo test` in the dev shell.
+          doCheck = false;
+          meta = {
+            description = "Native (non-web) live preview server for LaTeX, for the (patched) Zed editor";
+            mainProgram = "tex-livepreview";
+            license = lib.licenses.asl20;
+          };
+        };
+
+      # A Zed extension (Cargo.toml, src/, extension.toml under `dir`): only
+      # extension.toml and the wasm component, like Zed's own
+      # `zed: install dev extension` produces.
+      mkExtensionFrom = { pname, dir, wasm }: pkgs: rust:
         let
           lib = pkgs.lib;
           rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
         in
         pkgs.stdenv.mkDerivation {
-          pname = "zed-extension-typst-livepreview";
-          version = (lib.importTOML ./extension.toml).version;
+          inherit pname;
+          version = (lib.importTOML (dir + "/extension.toml")).version;
           src = lib.fileset.toSource {
-            root = ./.;
-            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./extension.toml ];
+            root = dir;
+            fileset = lib.fileset.unions [ (dir + "/Cargo.toml") (dir + "/Cargo.lock") (dir + "/src") (dir + "/extension.toml") ];
           };
-          cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+          cargoDeps = rustPlatform.importCargoLock { lockFile = dir + "/Cargo.lock"; };
           nativeBuildInputs = [ rustPlatform.cargoSetupHook rust pkgs.wasm-tools ];
           buildPhase = ''
             runHook preBuild
@@ -69,10 +89,21 @@
             mkdir -p $out
             cp extension.toml $out/
             wasm-tools strip -d '^(\.debug_.*|producers|target_features|component-name)$' \
-              -o $out/extension.wasm target/wasm32-wasip2/release/zed_typst_livepreview.wasm
+              -o $out/extension.wasm target/wasm32-wasip2/release/${wasm}
             runHook postInstall
           '';
         };
+
+      mkExtension = mkExtensionFrom {
+        pname = "zed-extension-typst-livepreview";
+        dir = ./.;
+        wasm = "zed_typst_livepreview.wasm";
+      };
+      mkTexExtension = mkExtensionFrom {
+        pname = "zed-extension-tex-livepreview";
+        dir = ./tex;
+        wasm = "zed_tex_livepreview.wasm";
+      };
 
       # Zed with the built-in Typst preview pane (zed-patch/).
       mkZed = zed-editor: zed-editor.overrideAttrs (old: {
@@ -98,6 +129,8 @@
         zed-editor = mkZed prev.zed-editor;
         # nixpkgs' rustc has no wasm32-wasip2 std; the wasm is platform independent.
         zed-extension-typst-livepreview = self.packages.${final.stdenv.hostPlatform.system}.zed-extension;
+        tex-livepreview = mkTexServer final final.rustPlatform;
+        zed-extension-tex-livepreview = self.packages.${final.stdenv.hostPlatform.system}.zed-extension-tex;
       };
 
       homeManagerModules.default = import ./nix/home-manager.nix self;
@@ -128,6 +161,8 @@
           typst-livepreview = server;
           zed-editor = mkZed pkgs.zed-editor;
           zed-extension = mkExtension pkgs rust;
+          tex-livepreview = mkTexServer pkgs rustPlatform;
+          zed-extension-tex = mkTexExtension pkgs rust;
         };
 
         apps.default = flake-utils.lib.mkApp { drv = server; };

@@ -53,6 +53,7 @@ Zed (パッチ適用済み)                         typst-livepreview (言語サ
 | `server/` | 言語サーバー兼レンダラ `typst-livepreview`(Rust, ネイティブ) |
 | `zed-patch/` | Zed へのパッチ: 外部の描画サーバー用のプレビューペイン(`external_preview`)と、拡張機能が宣言するツールバーボタン(`extension_toolbar`) |
 | `src/`, `extension.toml` | Zed 拡張機能(言語サーバーを起動するだけの WASM) |
+| `tex/` | LaTeX 版: 拡張機能(`tex/src`, `tex/extension.toml`)と描画サーバー `tex-livepreview`(`tex/server/`) |
 | `flake.nix` | ビルドに必要なツール一式・サーバー・パッチ適用済み Zed |
 | `docs/PROTOCOL.md` | Zed のペインとサーバー間のプロトコル |
 
@@ -179,6 +180,72 @@ nix develop -c zeditor .
     }
   }
 }
+```
+
+## LaTeX のライブプレビュー (`tex/`)
+
+同じプレビューペインで LaTeX もプレビューできます。Zed 側の変更はなく、拡張機能(`tex/`)と描画サーバー `tex-livepreview`(`tex/server/`)だけで動きます。
+
+- **保存不要**: 編集中の内容(未保存のバッファ)を一時ディレクトリに書き出し、`TEXINPUTS` の先頭に置いて latexmk でコンパイルします。プロジェクトのファイルや出力(`main.pdf` など)には触れません
+- **クリックでジャンプ / カーソル追従**: SyncTeX(`.synctex.gz`)を読み、行単位の対応を行内の位置まで補間します
+- **PDF の描画**: [hayro](https://github.com/LaurenzV/hayro)(Pure Rust の PDF ラスタライザ)で CPU 描画し、Typst と同じくストリップ単位のビットマップでペインに送ります。見た目の変わらないページはハッシュが変わらないので再描画されません
+- **エラー時**: 最後に成功した結果を表示したまま、ペイン下部に `file:line: メッセージ` を表示します
+
+| 項目(手元の計測) | 時間 |
+| --- | --- |
+| 1 文字の編集 → 新しいページがペインに届くまで(pdfLaTeX, 1〜2 ページ) | 約 0.6〜0.8 秒(ほぼ latexmk の実行時間) |
+| 1 ページの描画(A4, 2 px/pt) | 約 30 ms |
+
+### 必要なもの
+
+- パッチ適用済み Zed(上記。パッチなしの Zed ではプレビューは開けません)
+- Zed の **LaTeX 拡張機能**(`LaTeX` 言語と texlab を提供。補完・診断は texlab、プレビューはこの拡張機能)
+- TeX ディストリビューション(`latexmk` と使うエンジンが PATH にあること)
+
+### インストール
+
+home-manager モジュールで `programs.tex-livepreview.enable = true;` にすると、`tex-livepreview` を PATH に置き、拡張機能を Zed の拡張機能ディレクトリ(`installed/tex-livepreview`)にコピーします(オプションは `programs.typst-livepreview` と同じ: `package`, `extensionPackage`, `zedPackage`)。両方を有効にしても構いません。
+
+個別のパッケージは `nix build .#tex-livepreview`(サーバー)と `nix build .#zed-extension-tex`(拡張機能)です。
+
+### 使い方
+
+`.tex` を開いてツールバーの 👁 ボタン(Alt+クリックで同じペイン)、コマンドパレットの `external preview: open preview to the side`、またはコードアクションの **Open LaTeX Live Preview**。PDF ボタンはメインファイルの隣に `<メインファイル名>.pdf` を書き出します。
+
+**メインファイル**は次の順で決まります: 設定の `main` → `% !TEX root = ...` → 今プレビュー中の文書が読み込んでいるファイルならその文書 → `\documentclass` があればそのファイル自身 → 同じディレクトリか親ディレクトリにある、そのファイルを `\input`/`\include` している `.tex`。
+
+**エンジン**(`engine: "auto"`)は次の順で決まります: `% !TEX program = lualatex` などのマジックコメント → 文書と同じディレクトリの latexmkrc(`$pdf_mode` を設定しているもの)→ クラスとパッケージ(`js*`/`uj*` → upLaTeX + dvipdfmx、`ltj*`/`jlreq`/`fontspec`/`luatexja` → LuaLaTeX、`j*article` など → pLaTeX、`xeCJK` → XeLaTeX)→ `~/.latexmkrc`(`$pdf_mode` を設定しているもの)→ pdfLaTeX。
+
+```jsonc
+{
+  "lsp": {
+    "tex-livepreview": {
+      "settings": {
+        "main": "main.tex",      // 常にこのファイルをプレビュー
+        "engine": "auto",        // auto | latexmkrc | pdflatex | lualatex | xelatex | uplatex | platex
+        "latexmk_args": [],      // latexmk への追加引数
+        "command": null,         // latexmk の代わりに使うコマンド(配列)。%MAIN% と %OUTDIR% を置換
+        "debounce_ms": 150,      // 最後の編集からコンパイルまでの待ち時間
+        "follow_cursor": true,
+        "invert_colors": false,
+        "auto_open": false
+      },
+      "binary": { "path": "/path/to/tex-livepreview" }
+    }
+  }
+}
+```
+
+制限: 未保存の内容が反映されるのは、メインファイルと、そのディレクトリ以下にあり `./` や `../` で始まらない名前で読み込まれるファイルです(`\input{../common}` などは保存済みの内容になります)。SyncTeX は行単位の情報しか持たないため、行内の位置は推定です。
+
+開発:
+
+```sh
+cd tex/server
+cargo test
+./target/debug/tex-livepreview check main.tex --png page1.png    # 1 回コンパイルして結果を表示
+python3 -I tests/embed_smoke.py target/debug/tex-livepreview      # Zed 役の偽ペインでプロトコル試験
+python3 -I tests/zed_e2e.py <パッチ済み zed> <サーバー> <拡張機能ディレクトリ> <LaTeX 拡張機能ディレクトリ> <作業ディレクトリ>  # 実際の Zed で通し試験
 ```
 
 ## 開発

@@ -1,6 +1,8 @@
 # Rust build output
 /target
 /server/target
+/tex/target
+/tex/server/target
 
 # Zed writes extension.wasm here on "install dev extension"
 *.wasm

@@ -506,8 +506,7 @@ fn run(job: &Job, outcome: &mut Outcome) -> Result<(), String> {
         let line = stderr
             .lines()
             .chain(stdout.lines())
-            .filter(|l| l.contains("rror") || l.contains("not found") || l.contains("failed"))
-            .last()
+            .rfind(|l| l.contains("rror") || l.contains("not found") || l.contains("failed"))
             .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
             .unwrap_or("compilation failed");
         outcome.errors.push(format!("{program}: {}", line.trim()));
