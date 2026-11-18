@@ -1,11 +1,14 @@
 """End to end: patched Zed + this extension + the real typst-livepreview server.
 
 Copies the installed Typst extension (for the language definition) into an
-isolated user data dir; reads Zed's log (~/Library/Logs/Zed/Zed.log).
+isolated user data dir; reads Zed's log (macOS: ~/Library/Logs/Zed/Zed.log,
+Linux: <scratch dir>/zed-data/logs/Zed.log).
 Usage: python3 -I zed-patch/tests/e2e_test.py <zed binary> <server binary> <extension .wasm> <scratch dir>
 """
 import json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
+
+MAC = sys.platform == "darwin"
 
 ZED, SERVER, WASM, base = sys.argv[1], sys.argv[2], sys.argv[3], Path(sys.argv[4])
 shutil.rmtree(base, ignore_errors=True)
@@ -14,7 +17,10 @@ data = base / "zed-data"
 main = proj / "main.typ"
 main.write_text("#set page(width: 300pt, height: auto)\n= Hello Zed\n\nLive preview inside the editor.\n")
 
-user_ext = Path.home() / "Library/Application Support/Zed/extensions"
+if MAC:
+    user_ext = Path.home() / "Library/Application Support/Zed/extensions"
+else:
+    user_ext = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "zed/extensions"
 inst = data / "extensions/installed"; inst.mkdir(parents=True)
 shutil.copytree(user_ext / "installed/typst", inst / "typst")
 (data / "extensions/work").mkdir(parents=True)
@@ -43,7 +49,8 @@ languages = ["Typst"]
     "lsp": {"typst-livepreview": {"binary": {"path": SERVER}, "settings": {"auto_open": True}}},
 }))
 
-LOG = Path.home() / "Library/Logs/Zed/Zed.log"
+# On Linux, Zed keeps its logs in the (here: isolated) data dir.
+LOG = Path.home() / "Library/Logs/Zed/Zed.log" if MAC else data / "logs/Zed.log"
 log_start = LOG.stat().st_size if LOG.exists() else 0
 out = open(base / "zed.out", "w")
 env = dict(os.environ, ZED_LOG="external_preview=debug,info", RUST_LOG="typst_livepreview=debug")
@@ -52,6 +59,8 @@ proc = subprocess.Popen([ZED, "--user-data-dir", str(data), str(proj), str(main)
 def wait_log(pattern, timeout, start=0):
     t0 = time.time()
     while time.time() - t0 < timeout:
+        if not LOG.exists():
+            time.sleep(0.1); continue
         with open(LOG, "rb") as f:
             f.seek(log_start); text = f.read().decode(errors="replace")
         m = [x for x in re.finditer(pattern, text)]

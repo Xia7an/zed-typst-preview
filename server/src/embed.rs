@@ -2,8 +2,8 @@
 //!
 //! When Zed runs with the `external_preview` patch, it listens on a Unix
 //! socket at `/tmp/zed-preview-<uid>/<zed pid>.sock` (older patches:
-//! `/tmp/zed-typst-preview-…`). The language server (a child of Zed) connects
-//! to it at startup and then streams page bitmaps to the pane instead of
+//! `/tmp/zed-typst-preview-…`). The language server (a child of Zed; on Linux
+//! also a grandchild, through a wrapper) connects to it at startup and then streams page bitmaps to the pane instead of
 //! opening its own window. See `docs/PROTOCOL.md`.
 //!
 //! Frame format (both directions):
@@ -35,11 +35,48 @@ pub fn socket_paths() -> Vec<PathBuf> {
         }
     }
     let uid = unsafe { libc::getuid() };
-    let sock = format!("{}.sock", std::os::unix::process::parent_id());
-    ["zed-preview", "zed-typst-preview"]
-        .iter()
-        .map(|dir| PathBuf::from(format!("/tmp/{dir}-{uid}")).join(&sock))
-        .collect()
+    let mut paths = Vec::new();
+    for pid in editor_pids() {
+        let sock = format!("{pid}.sock");
+        for dir in ["zed-preview", "zed-typst-preview"] {
+            paths.push(PathBuf::from(format!("/tmp/{dir}-{uid}")).join(&sock));
+        }
+    }
+    paths
+}
+
+/// Processes that may be Zed, nearest first: our parent, and on Linux also
+/// its ancestors (a wrapper script, `env`, `nix run`, … may sit in between).
+fn editor_pids() -> Vec<u32> {
+    let parent = std::os::unix::process::parent_id();
+    #[cfg(target_os = "linux")]
+    {
+        let mut pids = vec![parent];
+        let mut pid = parent;
+        while pids.len() < 8 {
+            match linux_parent_pid(pid) {
+                Some(ppid) if ppid > 1 && !pids.contains(&ppid) => {
+                    pids.push(ppid);
+                    pid = ppid;
+                }
+                _ => break,
+            }
+        }
+        pids
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        vec![parent]
+    }
+}
+
+/// The parent of `pid`, from `/proc/<pid>/stat` (`pid (comm) state ppid …`).
+#[cfg(target_os = "linux")]
+fn linux_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` may contain spaces and parentheses: the fields follow the last `)`.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Connects to Zed's preview pane host, if the editor provides one.
@@ -445,5 +482,14 @@ mod tests {
         let (h, p) = read_frame(&mut &buf[..]).unwrap();
         assert_eq!(h["type"], "x");
         assert_eq!(p, vec![1, 2, 3]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_parent_pid() {
+        assert_eq!(linux_parent_pid(std::process::id()), Some(std::os::unix::process::parent_id()));
+        let pids = editor_pids();
+        assert_eq!(pids[0], std::os::unix::process::parent_id());
+        assert!(!pids.contains(&1));
     }
 }

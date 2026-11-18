@@ -77,7 +77,19 @@ fn main() {
         }
     }
 
-    let event_loop = build_event_loop();
+    let Some(event_loop) = build_event_loop() else {
+        if mode == "preview" {
+            std::process::exit(1);
+        }
+        // No display to open a window on (e.g. on Linux without `DISPLAY` /
+        // `WAYLAND_DISPLAY`): keep serving the language server (PDF export
+        // still works), without a preview window.
+        log::warn!("no preview window available; running without one");
+        if let Err(e) = lsp::run(UiSender::new(|_| true), false) {
+            log::error!("language server error: {e:#}");
+        }
+        std::process::exit(0);
+    };
     let proxy = event_loop.create_proxy();
 
     let mut viewer = if mode == "preview" {
@@ -118,7 +130,7 @@ fn main() {
     std::process::exit(0);
 }
 
-fn build_event_loop() -> EventLoop<UiEvent> {
+fn build_event_loop() -> Option<EventLoop<UiEvent>> {
     let mut builder = EventLoop::<UiEvent>::with_user_event();
     #[cfg(target_os = "macos")]
     {
@@ -127,10 +139,10 @@ fn build_event_loop() -> EventLoop<UiEvent> {
         builder.with_activation_policy(ActivationPolicy::Accessory).with_default_menu(false);
     }
     match builder.build() {
-        Ok(el) => el,
+        Ok(el) => Some(el),
         Err(e) => {
             log::error!("cannot create the window event loop: {e}");
-            std::process::exit(1);
+            None
         }
     }
 }

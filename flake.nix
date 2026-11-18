@@ -12,13 +12,25 @@
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
     let
+      # Libraries winit loads at run time on Linux (Wayland / X11). The X11
+      # ones were renamed in nixpkgs 26.05 (`xorg.libX11` → `libx11`); the
+      # overlay may be applied to an older nixpkgs.
+      linuxRuntimeLibsOf = pkgs: [
+        pkgs.libxkbcommon
+        pkgs.wayland
+        (pkgs.libx11 or pkgs.xorg.libX11)
+        (pkgs.libxcursor or pkgs.xorg.libXcursor)
+        (pkgs.libxi or pkgs.xorg.libXi)
+        (pkgs.libxrandr or pkgs.xorg.libXrandr)
+      ];
+
       # The language server / renderer.
       mkServer = pkgs: rustPlatform:
         let
           lib = pkgs.lib;
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-          linuxRuntimeLibs = with pkgs; [ libxkbcommon wayland xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr ];
+          linuxRuntimeLibs = linuxRuntimeLibsOf pkgs;
         in
         rustPlatform.buildRustPackage {
           pname = "typst-livepreview";
@@ -120,7 +132,7 @@
         };
         rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
         server = mkServer pkgs rustPlatform;
-        linuxRuntimeLibs = with pkgs; [ libxkbcommon wayland xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr ];
+        linuxRuntimeLibs = linuxRuntimeLibsOf pkgs;
       in
       {
         packages = {

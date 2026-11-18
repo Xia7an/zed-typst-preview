@@ -5,7 +5,8 @@ Zed で動く Typst のライブプレビューです。[tinymist](https://githu
 - **入力が即座に反映**: キー入力ごとにメモリ上でインクリメンタルコンパイルし、レイアウトの差分から見た目が変わった帯(数行分)だけを再ラスタライズ・転送(保存不要・デバウンスなし)
 - **クリックでジャンプ**: プレビューをクリックすると、対応する `.typ` の位置にカーソルが移動
 - **カーソル追従**: エディタのカーソル位置をプレビュー上に表示し、見えていなければスクロール
-- **Zed の中に表示**: Zed のペイン(タブ/分割)としてプレビューを表示。描画は Zed 自身の GPU レンダラ(GPUI/Metal)
+- **Zed の中に表示**: Zed のペイン(タブ/分割)としてプレビューを表示。描画は Zed 自身の GPU レンダラ(GPUI: macOS は Metal、Linux は wgpu/Vulkan)
+- **macOS / Linux 対応**: どちらでもパッチ適用済み Zed のペインで動きます(Linux は X11 / Wayland)
 
 レンダリングは `typst-render`(tiny-skia による CPU ラスタライズ)→ BGRA ビットマップ → GPUI の画像描画です。HTML/SVG/WebView/WebSocket は使っていません。
 
@@ -56,7 +57,7 @@ Zed (パッチ適用済み)                         typst-livepreview (言語サ
 | `flake.nix` | ビルドに必要なツール一式・サーバー・パッチ適用済み Zed |
 | `docs/PROTOCOL.md` | Zed のペインとサーバー間のプロトコル |
 
-Zed の拡張機能 API では独自の描画ペインを作れないため、Zed 本体に小さなパッチを当てています。パッチなしの Zed でも動きますが、その場合プレビューは別ウィンドウ(winit + softbuffer)になります。
+Zed の拡張機能 API では独自の描画ペインを作れないため、Zed 本体に小さなパッチを当てています。パッチなしの Zed でも動きますが、その場合プレビューは別ウィンドウ(winit + softbuffer)になります。ウィンドウを開けない環境(Linux で `WAYLAND_DISPLAY` も `DISPLAY` も無いなど)では、プレビューなしで言語サーバーとして動き続けます(PDF 出力は使えます)。
 
 パッチのペインとボタンは Typst 専用ではありません。描画サーバーは `hello` で「何を描くか(`kind`)・どの拡張子か・レイアウト(固定 / ペイン幅で組み直す)」を名乗り、ページのビットマップを送ります。Markdown など別の形式のプレビューも、Zed を変更せずに拡張機能(サーバーとボタンの宣言)と描画サーバーだけで作れます。書き方は `docs/PROTOCOL.md` の「Writing a preview server」を参照してください。
 
@@ -143,11 +144,11 @@ nix develop -c zeditor .
 
 | 操作 | 方法 |
 | --- | --- |
-| プレビューを開く | `.typ` を開いてツールバーの 👁 ボタン(分割で開く / Alt+クリックで同じペイン)、コマンドパレットの `external preview: open preview to the side`、またはコードアクション(`Cmd+.`)の **Open Typst Live Preview** |
+| プレビューを開く | `.typ` を開いてツールバーの 👁 ボタン(分割で開く / Alt+クリックで同じペイン)、コマンドパレットの `external preview: open preview to the side`、またはコードアクション(`Cmd+.`、Linux は `Ctrl+.`)の **Open Typst Live Preview** |
 | PDF を書き出す | ツールバーの PDF ボタン(👁 の左)。メインファイルの隣に `<メインファイル名>.pdf` を書き出します(保存前の編集も反映)。パッチなしの Zed ではコードアクションの **Export PDF** |
 | ソースへジャンプ | プレビューをクリック |
 | スクロール | ホイール / トラックパッド / ドラッグ / 矢印・PageUp/Down・Space |
-| ズーム | `Cmd` + ホイール、ピンチ、`Cmd +` / `Cmd -`、`Cmd 0`(幅に合わせる) |
+| ズーム | `Cmd` + ホイール、ピンチ、`Cmd +` / `Cmd -`、`Cmd 0`(幅に合わせる)。Linux では `Cmd` の代わりに `Ctrl` |
 
 複数ファイルのプロジェクトでは、`#include` されたファイルを編集している間もメインファイルのプレビューが維持されます。依存関係にないファイルに移ると、プレビューはそのファイルに切り替わります(固定したい場合は `main` を設定)。
 
@@ -192,6 +193,7 @@ cargo build --release
 ./target/release/typst-livepreview preview ../examples/demo.typ  # 別ウィンドウで単体起動
 python3 -I tests/embed_smoke.py target/release/typst-livepreview # Zed ペインのプロトコル試験
 CLICK=600,130 python3 -I tests/lsp_smoke.py target/release/typst-livepreview  # LSP 経由の通し試験
+# Linux(拡大率 1)では CLICK=300,65。ディスプレイが無ければ xvfb-run -a を前に付ける
 ```
 
 デバッグ用の環境変数: `RUST_LOG=typst_livepreview=debug`(「edit → on screen」の遅延を記録)、`TYPST_LIVEPREVIEW_NO_EMBED=1`(常に別ウィンドウ)。
@@ -201,8 +203,9 @@ Zed のパッチを更新するときは、Zed v1.26.2 のソースの `crates/`
 ```sh
 nix develop /path/to/zed-typst-livepreview#zed-editor -c bash -c \
   'unset LK_CUSTOM_WEBRTC; CARGO_PROFILE_DEV_DEBUG=0 cargo build -p zed --features gpui_platform/runtime_shaders'
+# Linux では --features gpui_platform/runtime_shaders(macOS の Metal 用)は不要
 python3 -I zed-patch/tests/pane_test.py target/debug/zed /tmp/tlp-pane      # 偽サーバー(Typst v2 互換 + Markdown 風 reflow)でペインを試験
 python3 -I zed-patch/tests/e2e_test.py target/debug/zed <server> <extension.wasm> /tmp/tlp-e2e  # 実サーバーで通し試験
 ```
 
-ペインのログは `ZED_LOG=external_preview=debug` で `~/Library/Logs/Zed/Zed.log` に出ます。
+ペインのログは `ZED_LOG=external_preview=debug` で `~/Library/Logs/Zed/Zed.log`(Linux: `~/.local/share/zed/logs/Zed.log`、`--user-data-dir` 指定時はその下の `logs/Zed.log`)に出ます。

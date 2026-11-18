@@ -62,8 +62,9 @@ try:
     h, _ = read(conn)
     assert h["type"] == "attach", h
     # Bring the test window to the front so it renders frames.
-    subprocess.run(["osascript", "-e", 'tell application "System Events" to set frontmost of '
-                    f'(first process whose unix id is {proc.pid}) to true'], capture_output=True)
+    if sys.platform == "darwin":
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to set frontmost of '
+                        f'(first process whose unix id is {proc.pid}) to true'], capture_output=True)
     print(f"✓ Zed opened the preview pane and attached: {h['path']}")
     write(conn, {"type": "target", "path": str(main), "title": "main.typ"})
 
